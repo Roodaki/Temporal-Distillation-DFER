@@ -1,291 +1,378 @@
+# ─── THREAD / TF CONFIG: MUST COME BEFORE DEEPFACE / TENSORFLOW IMPORTS ───────
+import os
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
+# Optional:
+# Use this if you want to force a specific GPU, e.g. GPU 0.
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 import cv2
-from deepface import DeepFace
+
+cv2.setNumThreads(0)
+
 import pandas as pd
 import matplotlib.pyplot as plt
-import os
 import multiprocessing as mp
 import time
 import pathlib
-import numpy as np
+import traceback
 
-# --- Configuration ---
-# Set the path to the folder containing the source video files
-source_videos_directory = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Facial Emotion Recognition (FER)\Dataset\rotated_face448"  # <--- Change this to the folder path
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+INPUT_DIR = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face"
 
-# Set the parent directory where the [video_name]_analyze folder will be created.
-analysis_output_parent_directory = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Facial Emotion Recognition (FER)\Dataset\rotated_face448_analyze"
+OUTPUT_DIR = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face_analyze"
+
+# IMPORTANT:
+# Use "skip" only if videos are already face-cropped.
+# Since your input folder is DFEW_face, this is likely appropriate.
+DETECTOR_BACKEND = "skip"
+
+# With detector_backend="skip", alignment is not useful.
+ALIGN_FACE = False
+
+GENERATE_PLOTS = True
+
+# GPU recommendation:
+# TensorFlow/DeepFace usually grabs most GPU memory, so use 1 worker.
+# If you have a very large GPU and want to experiment, try 2.
+NUM_WORKERS = 16
+
+# If you later run CPU-only, try:
+# NUM_WORKERS = min(4, max(1, mp.cpu_count() - 1))
+
+EMOTIONS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
+
+# DeepFace is imported lazily inside each worker process.
+DeepFace = None
 
 
-# We only process MP4 files now
-video_extensions = [".mp4"]
+# ─── WORKER INITIALIZER ───────────────────────────────────────────────────────
+def _worker_init(backend: str, align_face: bool) -> None:
+    """
+    Called once per worker process.
 
-# Emotions deepface usually detects:
-emotions = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
+    This:
+    1. Configures TensorFlow GPU memory growth.
+    2. Imports DeepFace inside the worker.
+    3. Warms up the emotion model once.
+    """
+    global DeepFace
+    global _BACKEND
+    global _ALIGN_FACE
 
-# --- Accuracy Enhancement Configuration ---
-# Choose a face detector backend. More accurate backends can improve detection.
-# Options: 'opencv', 'retinaface', 'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8', 'yunet'.
-# 'retinaface', 'mtcnn', 'yolov8', 'yunet', 'mediapipe' are often more accurate.
-# Some backends might require additional installations (e.g., 'yolov8' needs 'ultralytics', 'mediapipe' needs 'mediapipe').
-# Experiment to find the best one for your dataset.
-DETECTOR_BACKEND = "mtcnn"  # <--- Change this to experiment
-
-# Number of processes to use. Defaults to the number of CPU cores.
-NUM_PROCESSES = mp.cpu_count()
-
-
-# --- Worker Function for Parallel Processing ---
-def analyze_single_frame(frame_tuple):
-    """Analyzes a single frame for emotions."""
-    frame_count, frame = frame_tuple
-    # Ensure 'emotions' list is accessible if it's not passed or global in worker's context
-    # For this script structure, 'emotions' is a global variable accessible by the worker.
+    _BACKEND = backend
+    _ALIGN_FACE = align_face
 
     try:
-        # Using the configured DETECTOR_BACKEND and ensuring alignment is on (default)
-        # enforce_detection=False: if no face, DeepFace won't raise an error,
-        # but analysis_results might be empty or lack 'emotion'.
-        analysis_results = DeepFace.analyze(
-            frame,
-            actions=["emotion"],
-            detector_backend=DETECTOR_BACKEND,
-            enforce_detection=False,  # Keeps current behavior: script continues, records zeros if no face
-            align=True,  # Face alignment is generally good for accuracy (default is True)
-        )
+        import tensorflow as tf
 
-        if (
-            analysis_results
-            and isinstance(analysis_results, list)
-            and len(analysis_results) > 0
-        ):
-            face_result = analysis_results[
-                0
-            ]  # DeepFace returns a list of dicts (taking the first detected face)
-            emotions_in_frame = face_result.get("emotion", {})  # Use .get for safety
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            for gpu in gpus:
+                try:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                except Exception:
+                    pass
 
-            frame_entry = {"frame": frame_count}
-            for emotion_key in emotions:  # Use the global 'emotions' list
-                frame_entry[emotion_key] = emotions_in_frame.get(emotion_key, 0.0)
-            return (frame_count, frame_entry)
-        else:  # No face detected or empty results
-            frame_entry = {"frame": frame_count}
-            for emotion_key in emotions:
-                frame_entry[emotion_key] = 0.0
-            return (frame_count, frame_entry)
+            print(f"[GPU] Worker PID {os.getpid()} sees {len(gpus)} GPU(s):")
+            for gpu in gpus:
+                print(f"      {gpu}")
+        else:
+            print(
+                f"[WARN] Worker PID {os.getpid()} does not see a GPU. Running on CPU."
+            )
 
     except Exception as e:
-        # It's good to know which frame in which process failed.
-        print(
-            f"Error processing frame {frame_count} in worker (PID {os.getpid()}) with backend {DETECTOR_BACKEND}: {e}"
-        )
-        frame_entry = {"frame": frame_count}
-        for emotion_key in emotions:
-            frame_entry[emotion_key] = 0.0
-        return (frame_count, frame_entry)
+        print(f"[WARN] Could not configure TensorFlow GPU memory growth: {e}")
 
+    from deepface import DeepFace as _DeepFace
 
-# --- Main Execution Block ---
-if __name__ == "__main__":
-    # Set multiprocessing start method once
+    DeepFace = _DeepFace
+
+    # Warm-up model once so the first real frame does not pay initialization cost.
     try:
-        mp.set_start_method("spawn", force=True)
-    except RuntimeError:
-        # print("Multiprocessing start method already set or can't be forced.")
-        pass  # If it's already set or can't be changed, continue.
+        import numpy as np
 
-    print(f"Using {NUM_PROCESSES} processes for analysis of each video.")
-    print(f"Using face detector backend: {DETECTOR_BACKEND}")
+        dummy = np.zeros((224, 224, 3), dtype="uint8")
 
-    # --- Step 0: Setup Directories ---
-    source_dir_path = pathlib.Path(source_videos_directory)
-    if not source_dir_path.is_dir():
-        print(f"Error: Source videos directory not found: {source_videos_directory}")
-        exit()
-
-    analysis_output_parent_path = pathlib.Path(analysis_output_parent_directory)
-    analysis_output_parent_path.mkdir(parents=True, exist_ok=True)
-    print(f"Analysis folders will be created in: {analysis_output_parent_path}")
-
-    # --- Find Video Files (MP4 only) ---
-    video_files = []
-    print(f"Searching for MP4 videos in: {source_videos_directory}")
-    for item in source_dir_path.iterdir():
-        if item.is_file() and item.suffix.lower() in video_extensions:
-            video_files.append(item)
-
-    if not video_files:
-        print(f"No MP4 video files found in {source_videos_directory}.")
-        exit()
-
-    print(f"Found {len(video_files)} videos to process.")
-    script_start_time = time.time()
-
-    # --- Process Each Video ---
-    for video_file in video_files:
-        print("\n" + "=" * 50)
-        print(f"Processing video: {video_file.name}")
-        start_time_video = time.time()
-
-        # --- Create Analysis Output Folder for the current video ---
-        analysis_folder_name = video_file.stem + "_analyze"
-        analysis_folder_path = analysis_output_parent_path / analysis_folder_name
-        analysis_folder_path.mkdir(parents=True, exist_ok=True)
-        print(
-            f"  Analysis output for '{video_file.name}' will be saved in: {analysis_folder_path}"
+        DeepFace.analyze(
+            dummy,
+            actions=["emotion"],
+            detector_backend=_BACKEND,
+            enforce_detection=False,
+            align=_ALIGN_FACE,
+            silent=True,
         )
 
-        # --- Step 1: Load the Video (for reading frames for analysis) ---
-        cap_analyze = cv2.VideoCapture(str(video_file))
-        if not cap_analyze.isOpened():
-            print(f"  Error: Could not open video {video_file.name}. Skipping.")
-            continue
+        print(f"[INIT] Worker PID {os.getpid()} warmed up DeepFace.")
 
-        total_frames = int(cap_analyze.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap_analyze.get(cv2.CAP_PROP_FPS)
-        print(f"  '{video_file.name}': Total frames={total_frames}, FPS={fps:.2f}")
+    except Exception as e:
+        print(f"[WARN] DeepFace warm-up failed in PID {os.getpid()}: {e}")
 
-        frames_to_process = []
-        frame_count_read = (
-            0  # Renamed to avoid confusion with frame_count in analyze_single_frame
+
+# ─── FRAME ANALYSIS ───────────────────────────────────────────────────────────
+def analyze_single_frame(frame_count: int, frame) -> dict:
+    """
+    Analyze one frame and return one CSV row.
+    Keeps the same output columns as your original script.
+    """
+    entry = {"frame": frame_count}
+
+    try:
+        results = DeepFace.analyze(
+            frame,
+            actions=["emotion"],
+            detector_backend=_BACKEND,
+            enforce_detection=False,
+            align=_ALIGN_FACE,
+            silent=True,
         )
+
+        # DeepFace may return either a list or a dict depending on version.
+        if isinstance(results, list) and len(results) > 0:
+            emotions_in_frame = results[0].get("emotion", {})
+        elif isinstance(results, dict):
+            emotions_in_frame = results.get("emotion", {})
+        else:
+            emotions_in_frame = {}
+
+    except Exception as e:
+        print(f"  [WARN] Frame {frame_count} PID {os.getpid()}: {e}")
+        emotions_in_frame = {}
+
+    for emotion in EMOTIONS:
+        entry[emotion] = float(emotions_in_frame.get(emotion, 0.0))
+
+    return entry
+
+
+# ─── VIDEO PROCESSING ─────────────────────────────────────────────────────────
+def process_video_task(args: tuple) -> tuple:
+    """
+    One worker processes one whole video.
+
+    This is faster than sending every frame through multiprocessing because:
+    - frames stay inside the same process
+    - no frame pickling / IPC overhead
+    - GPU model stays warm inside that process
+    """
+    video_path_str, output_dir_str = args
+
+    video_path = pathlib.Path(video_path_str)
+    output_dir = pathlib.Path(output_dir_str)
+
+    class_name = video_path.parent.name
+    video_output_dir = output_dir / class_name / (video_path.stem + "_analyze")
+    csv_path = video_output_dir / "emotion_data.csv"
+
+    if csv_path.exists():
+        return ("skip", class_name, video_path.name, 0, 0.0, "already analyzed")
+
+    video_output_dir.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return ("error", class_name, video_path.name, 0, 0.0, "could not open video")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if total_frames <= 0:
+        cap.release()
+        return ("error", class_name, video_path.name, 0, fps, "zero frames")
+
+    records = [None] * total_frames
+
+    frame_count = 0
+
+    try:
         while True:
-            ret, frame = cap_analyze.read()
+            ret, frame = cap.read()
             if not ret:
                 break
-            frame_count_read += 1
-            frames_to_process.append((frame_count_read, frame.copy()))
-        cap_analyze.release()
 
-        if not frames_to_process:
-            print(f"  No frames read from '{video_file.name}'. Skipping this video.")
+            frame_count += 1
+
+            # Keep your original speed optimization:
+            # Downscale very large frames to width 480.
+            # This usually does not hurt emotion recognition if faces remain clear.
+            h, w = frame.shape[:2]
+            if w > 480:
+                scale = 480 / w
+                frame = cv2.resize(
+                    frame,
+                    (480, int(h * scale)),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            entry = analyze_single_frame(frame_count, frame)
+
+            # frame_count starts at 1, list index starts at 0.
+            if frame_count <= total_frames:
+                records[frame_count - 1] = entry
+            else:
+                records.append(entry)
+
+    except Exception as e:
+        cap.release()
+        tb = traceback.format_exc()
+        return ("error", class_name, video_path.name, frame_count, fps, f"{e}\n{tb}")
+
+    cap.release()
+
+    records = [r for r in records if r is not None]
+
+    if not records:
+        return ("error", class_name, video_path.name, 0, fps, "no analysis results")
+
+    df = pd.DataFrame(records)
+    df.to_csv(csv_path, index=False)
+
+    if GENERATE_PLOTS:
+        _save_plots(df, video_path.name, video_output_dir)
+
+    return ("ok", class_name, video_path.name, len(records), fps, str(csv_path))
+
+
+# ─── PLOTTING ─────────────────────────────────────────────────────────────────
+def _save_plots(df: pd.DataFrame, video_name: str, output_dir: pathlib.Path) -> None:
+    plt.figure(figsize=(15, 7))
+
+    for emotion in EMOTIONS:
+        if emotion in df.columns:
+            plt.plot(df["frame"], df[emotion], label=emotion.capitalize())
+
+    plt.xlabel("Frame Number")
+    plt.ylabel("Emotion Score (0–100)")
+    plt.title(f"Facial Emotions — {video_name} [{DETECTOR_BACKEND}]")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+
+    try:
+        plt.savefig(output_dir / f"all_emotions_{DETECTOR_BACKEND}.png")
+    except Exception as e:
+        print(f"  [WARN] Could not save all_emotions plot: {e}")
+
+    plt.close()
+
+    for emotion in EMOTIONS:
+        if emotion not in df.columns:
             continue
-        print(
-            f"  Read {len(frames_to_process)} frames. Starting parallel emotion analysis using '{DETECTOR_BACKEND}'..."
-        )
 
-        # --- Step 2-5 (Parallel): Analyze frames ---
-        analysis_start_time = time.time()
-
-        with mp.Pool(processes=NUM_PROCESSES) as pool:
-            # Adjust chunksize: A larger chunksize can be more efficient for very many short tasks
-            # but smaller can give better load balancing.
-            # Heuristic: at least 1, and aim for a few chunks per process.
-            num_tasks = len(frames_to_process)
-            chunksize = max(1, num_tasks // (NUM_PROCESSES * 4))
-            if (
-                num_tasks < NUM_PROCESSES * 4
-            ):  # Ensure small tasks get processed quickly too
-                chunksize = max(1, num_tasks // NUM_PROCESSES)
-
-            results_iterator = pool.imap_unordered(
-                analyze_single_frame,
-                frames_to_process,
-                chunksize=chunksize,
-            )
-
-            processed_results = []
-            total_frames_to_analyze = len(frames_to_process)
-            for i, result in enumerate(results_iterator):
-                processed_results.append(result)
-                if (i + 1) % 200 == 0 or (i + 1) == total_frames_to_analyze:
-                    print(f"    Analyzed {i + 1}/{total_frames_to_analyze} frames...")
-
-        analysis_end_time = time.time()
-        print(
-            f"  Parallel analysis finished in {analysis_end_time - analysis_start_time:.2f} seconds."
-        )
-
-        # --- Step 6: Process and Store Data (Analysis Data) ---
-        if not processed_results:
-            print(
-                f"  No results returned from analysis for '{video_file.name}'. Skipping CSV and plot generation."
-            )
-            continue
-
-        processed_results.sort(key=lambda x: x[0])  # Sort by frame number
-        emotion_data_list = [
-            item[1]
-            for item in processed_results
-            if item is not None
-            and item[1] is not None  # Ensure item and its data are not None
-        ]
-
-        if not emotion_data_list:
-            print(
-                f"  No valid emotion data collected for '{video_file.name}'. Skipping CSV and plot generation."
-            )
-            continue
-
-        df = pd.DataFrame(emotion_data_list)
-        if df.empty:
-            print(
-                f"  DataFrame is empty for '{video_file.name}'. Skipping CSV and plot generation."
-            )
-            continue
-
-        csv_output_path = analysis_folder_path / "emotion_data.csv"
-        df.to_csv(csv_output_path, index=False)
-        print(f"  Emotion data saved to {csv_output_path}")
-
-        # --- Step 7: Plot and Save Analysis Results ---
-        print(f"  Generating plots for '{video_file.name}'...")
-        plot_generation_start_time = time.time()
-
-        plt.figure(figsize=(15, 7))
-        for emotion_key in emotions:
-            if emotion_key in df.columns:
-                plt.plot(df["frame"], df[emotion_key], label=emotion_key.capitalize())
+        plt.figure(figsize=(10, 5))
+        plt.plot(df["frame"], df[emotion], label=emotion.capitalize())
         plt.xlabel("Frame Number")
-        plt.ylabel("Emotion Score (0-100)")
-        plt.title(
-            f"Facial Emotion Over Time ({video_file.name}) - Detector: {DETECTOR_BACKEND}"
-        )
-        plt.legend()
+        plt.ylabel(f"{emotion.capitalize()} Score (0–100)")
+        plt.title(f"{emotion.capitalize()} — {video_name} [{DETECTOR_BACKEND}]")
         plt.grid(True)
         plt.tight_layout()
-        all_plot_path = (
-            analysis_folder_path / f"all_emotions_plot_{DETECTOR_BACKEND}.png"
-        )
+
         try:
-            plt.savefig(all_plot_path)
-            print(f"  'All emotions' plot saved to {all_plot_path}")
-        except Exception as e_plot:
-            print(f"  Error saving all_emotions_plot: {e_plot}")
+            plt.savefig(output_dir / f"{emotion}_{DETECTOR_BACKEND}.png")
+        except Exception as e:
+            print(f"  [WARN] Could not save {emotion} plot: {e}")
+
         plt.close()
 
-        for emotion_key in emotions:
-            if emotion_key in df.columns:
-                plt.figure(figsize=(10, 5))
-                plt.plot(
-                    df["frame"],
-                    df[emotion_key],
-                    label=emotion_key.capitalize(),
-                    color="blue",
-                )
-                plt.xlabel("Frame Number")
-                plt.ylabel(f"{emotion_key.capitalize()} Score (0-100)")
-                plt.title(
-                    f"{emotion_key.capitalize()} Emotion Over Time ({video_file.name}) - Detector: {DETECTOR_BACKEND}"
-                )
-                plt.grid(True)
-                plt.tight_layout()
-                individual_plot_path = (
-                    analysis_folder_path
-                    / f"{emotion_key}_emotion_plot_{DETECTOR_BACKEND}.png"
-                )
-                try:
-                    plt.savefig(individual_plot_path)
-                except Exception as e_plot_ind:
-                    print(f"  Error saving {emotion_key}_emotion_plot: {e_plot_ind}")
-                plt.close()
-        print(
-            f"  Plots generated in {time.time() - plot_generation_start_time:.2f} seconds."
-        )
 
-        end_time_video = time.time()
-        print(
-            f"  Finished processing video '{video_file.name}' in {end_time_video - start_time_video:.2f} seconds."
-        )
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
 
-    print("\n" + "=" * 50)
-    print(f"All videos processed in {time.time() - script_start_time:.2f} seconds.")
+    input_root = pathlib.Path(INPUT_DIR)
+    output_root = pathlib.Path(OUTPUT_DIR)
+
+    if not input_root.is_dir():
+        print(f"ERROR: Input directory not found: {INPUT_DIR}")
+        raise SystemExit(1)
+
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    video_files = sorted(
+        list(input_root.rglob("*.mp4")),
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
+
+    if not video_files:
+        print(f"No MP4 files found under {INPUT_DIR}")
+        raise SystemExit(1)
+
+    total = len(video_files)
+
+    print("=" * 70)
+    print(f"Found videos      : {total}")
+    print(f"Detector backend  : {DETECTOR_BACKEND}")
+    print(f"Align face        : {ALIGN_FACE}")
+    print(f"Workers           : {NUM_WORKERS}")
+    print(f"Output directory  : {OUTPUT_DIR}")
+    print("=" * 70)
+    print()
+
+    script_start = time.time()
+    done = 0
+    skipped = 0
+    failed = 0
+
+    tasks = [(str(video_path), str(output_root)) for video_path in video_files]
+
+    with mp.Pool(
+        processes=NUM_WORKERS,
+        initializer=_worker_init,
+        initargs=(DETECTOR_BACKEND, ALIGN_FACE),
+    ) as pool:
+
+        for (
+            status,
+            class_name,
+            video_name,
+            n_frames,
+            fps,
+            message,
+        ) in pool.imap_unordered(
+            process_video_task,
+            tasks,
+            chunksize=1,
+        ):
+            done += 1
+
+            if status == "ok":
+                print(
+                    f"[{done}/{total}] [OK]   {class_name}/{video_name} — "
+                    f"{n_frames} frames, FPS={fps:.1f}"
+                )
+
+            elif status == "skip":
+                skipped += 1
+                print(f"[{done}/{total}] [SKIP] {class_name}/{video_name}")
+
+            else:
+                failed += 1
+                print(f"[{done}/{total}] [ERROR] {class_name}/{video_name}")
+                print(f"          {message}")
+
+            elapsed_total = time.time() - script_start
+            rate = done / elapsed_total if elapsed_total > 0 else 0
+            eta = (total - done) / rate if rate > 0 else 0
+
+            print(
+                f"          Progress: {rate:.3f} vid/s | " f"ETA {eta / 60:.1f} min\n"
+            )
+
+    total_time_min = (time.time() - script_start) / 60
+
+    print("=" * 70)
+    print(f"Finished.")
+    print(f"Processed : {done - skipped - failed}")
+    print(f"Skipped   : {skipped}")
+    print(f"Failed    : {failed}")
+    print(f"Total     : {total}")
+    print(f"Time      : {total_time_min:.1f} min")
+    print(f"Results   : {OUTPUT_DIR}")
+    print("=" * 70)

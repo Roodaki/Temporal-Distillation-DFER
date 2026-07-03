@@ -206,4 +206,31 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-models/checkpoints/
+# Checkpoints
+models//models/checkpoints/timesformer-large-finetuned-k400/best_timesformer.pth
+/models/checkpoints/timesformer-large-finetuned-k400/last_timesformer.pth
+/models/checkpoints/timesformer-base-finetuned-k400/best_timesformer.pth
+/models/checkpoints/timesformer-base-finetuned-k400/last_timesformer.pth
+/models/checkpoints/videomae/best_vivit.pth
+/models/checkpoints/videomae/last_vivit.pth
+
+datasets/
+checkpoints/
+runs/
+outputs/
+wandb/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.rar
+*.7z
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.npy
+*.npz
+*.pkl
+*.pickle

@@ -1,111 +1,164 @@
 import os
-import cv2
 import csv
-import sys
+import cv2
 
 
-def save_video_info_to_csv(directory_path, output_csv_path):
+def save_imagenet_style_videos_to_csv(dataset_root, output_csv_path):
     """
-    Gets the name, duration, and frame count of video files in a directory
-    using OpenCV and saves the information to a CSV file.
+    Reads an ImageNet-style dataset where each class is a folder,
+    but the samples are video files such as .mp4.
 
-    Args:
-        directory_path (str): The path to the directory containing video files.
-        output_csv_path (str): The path where the output CSV file will be saved.
+    Expected structure:
+        dataset_root/
+            class_1/
+                video001.mp4
+                video002.mp4
+            class_2/
+                video003.mp4
+
+    Output CSV columns:
+        Video Path, Filename, Class Name, Class Index,
+        Duration, Frame Count, FPS, Width, Height
     """
-    print(f"Scanning directory: {directory_path}\n")
+
+    print(f"Scanning dataset root: {dataset_root}")
     print(f"Writing video information to: {output_csv_path}\n")
 
-    # List of common video file extensions (you can add more if needed)
     video_extensions = [".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".ts"]
 
-    # Open the CSV file for writing
-    # newline='' is important to prevent extra blank rows in the CSV
+    class_names = [
+        d
+        for d in os.listdir(dataset_root)
+        if os.path.isdir(os.path.join(dataset_root, d))
+    ]
+
+    class_names.sort()
+
+    class_to_idx = {class_name: idx for idx, class_name in enumerate(class_names)}
+
     with open(output_csv_path, mode="w", newline="", encoding="utf-8") as csv_file:
         csv_writer = csv.writer(csv_file)
 
-        # Write the header row
         csv_writer.writerow(
-            ["Filename", "Duration (seconds)", "Duration (MM:SS)", "Frame Count"]
+            [
+                "Video Path",
+                "Filename",
+                "Class Name",
+                "Class Index",
+                "Duration (seconds)",
+                "Duration (MM:SS)",
+                "Frame Count",
+                "FPS",
+                "Width",
+                "Height",
+            ]
         )
 
-        for filename in os.listdir(directory_path):
-            file_path = os.path.join(directory_path, filename)
+        total_videos = 0
 
-            # Check if it's a file and not a directory
-            if os.path.isfile(file_path):
-                # Check if the file extension is in our list of video extensions
+        for class_name in class_names:
+            class_dir = os.path.join(dataset_root, class_name)
+            class_idx = class_to_idx[class_name]
+
+            print(f"Processing class: {class_name} -> label {class_idx}")
+
+            for filename in os.listdir(class_dir):
+                file_path = os.path.join(class_dir, filename)
+
+                if not os.path.isfile(file_path):
+                    continue
+
                 file_extension = os.path.splitext(filename)[1].lower()
-                if file_extension in video_extensions:
-                    cap = None  # Initialize cap outside the try block
-                    try:
-                        # Create a VideoCapture object
-                        cap = cv2.VideoCapture(file_path)
 
-                        # Check if video file was opened successfully
-                        if not cap.isOpened():
-                            print(f"Could not open video file: {filename}. Skipping.\n")
-                            # Write a row with partial info or error indication
-                            csv_writer.writerow(
-                                [filename, "Error: Could not open", "", ""]
-                            )
-                            continue  # Skip to the next file
+                if file_extension not in video_extensions:
+                    continue
 
-                        # Get frame count and FPS
-                        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                        fps = cap.get(cv2.CAP_PROP_FPS)
+                cap = None
 
-                        duration = 0
-                        duration_formatted = "N/A"
+                try:
+                    cap = cv2.VideoCapture(file_path)
 
-                        if fps > 0:
-                            duration = frame_count / fps  # Duration in seconds
-                            minutes = int(duration // 60)
-                            seconds = int(duration % 60)
-                            duration_formatted = f"{minutes:02d}:{seconds:02d}"
-                        else:
-                            print(
-                                f"Could not get FPS for {filename}. Cannot calculate duration.\n"
-                            )
-                            # Write a row with frame count but no duration
-                            csv_writer.writerow(
-                                [filename, "N/A (FPS=0)", "N/A", frame_count]
-                            )
-                            cap.release()  # Release the capture object
-                            continue  # Skip writing the full info row and move to next file
-
-                        # Release the video capture object
-                        cap.release()
-
-                        # Write the video information to the CSV file
+                    if not cap.isOpened():
+                        print(f"Could not open video: {file_path}")
                         csv_writer.writerow(
                             [
+                                file_path,
                                 filename,
-                                f"{duration:.2f}",
-                                duration_formatted,
-                                frame_count,
+                                class_name,
+                                class_idx,
+                                "Error: could not open",
+                                "",
+                                "",
+                                "",
+                                "",
+                                "",
                             ]
                         )
+                        continue
 
-                    except Exception as e:
-                        print(
-                            f"An error occurred with file {filename}: {e}. Skipping.\n"
-                        )
-                        # Write a row indicating an error occurred
-                        csv_writer.writerow([filename, f"Error: {e}", "", ""])
-                        if cap is not None:
-                            cap.release()  # Ensure release if an error occurs after opening
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-                # Optional: else block to print files that were skipped
-                # else:
-                #     print(f"Skipping non-video file: {filename}")
+                    if fps > 0:
+                        duration = frame_count / fps
+                        minutes = int(duration // 60)
+                        seconds = int(duration % 60)
+                        duration_formatted = f"{minutes:02d}:{seconds:02d}"
+                    else:
+                        duration = "N/A"
+                        duration_formatted = "N/A"
 
-    print(f"Finished processing directory. Information saved to {output_csv_path}")
+                    csv_writer.writerow(
+                        [
+                            file_path,
+                            filename,
+                            class_name,
+                            class_idx,
+                            (
+                                f"{duration:.2f}"
+                                if isinstance(duration, float)
+                                else duration
+                            ),
+                            duration_formatted,
+                            frame_count,
+                            f"{fps:.2f}" if fps > 0 else "N/A",
+                            width,
+                            height,
+                        ]
+                    )
+
+                    total_videos += 1
+
+                except Exception as e:
+                    print(f"Error processing {file_path}: {e}")
+                    csv_writer.writerow(
+                        [
+                            file_path,
+                            filename,
+                            class_name,
+                            class_idx,
+                            f"Error: {e}",
+                            "",
+                            "",
+                            "",
+                            "",
+                            "",
+                        ]
+                    )
+
+                finally:
+                    if cap is not None:
+                        cap.release()
+
+    print(f"\nFinished. Found {total_videos} video files.")
+    print(f"CSV saved to: {output_csv_path}")
 
 
-# --- Replace with your directory path and desired output CSV path ---
-video_directory = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Facial Emotion Recognition (FER)\Dataset\rotated_face448"
-output_csv_file = "./video_length448.csv"  # Change this to your desired output file
+# --- Replace this with your dataset root ---
+dataset_root = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face"
 
-# Run the function
-save_video_info_to_csv(video_directory, output_csv_file)
+output_csv_file = "./imagenet_style_video_dataset_info.csv"
+
+save_imagenet_style_videos_to_csv(dataset_root, output_csv_file)

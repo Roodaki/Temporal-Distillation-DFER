@@ -86,16 +86,17 @@ The models/ directory contains standard PyTorch implementations of the video tra
 
 ### Model Technical Specs
 
-| Architecture | Attention Scheme | Input Tensor Shape | Patch Size | Params | Pre-training |
-|---|---|---|---|---|---|
-| TimeSformer | Divided Space-Time | [B, 3, 8, 224, 224] | 16x16 | 122M | ImageNet-21K |
-| ViViT | Factorised Encoder | [B, 3, 16, 224, 224] | 16x16 | 115M | ImageNet-21K + Kinetics-400 |
+| Architecture | Attention Scheme   | Input Tensor Shape   | Patch Size | Params | Pre-training                |
+| ------------ | ------------------ | -------------------- | ---------- | ------ | --------------------------- |
+| TimeSformer  | Divided Space-Time | [B, 3, 8, 224, 224]  | 16x16      | 122M   | ImageNet-21K                |
+| ViViT        | Factorised Encoder | [B, 3, 16, 224, 224] | 16x16      | 115M   | ImageNet-21K + Kinetics-400 |
 
 ### Fine-Tuning Configuration
 
 Models are fine-tuned by freezing the pretrained backbone and training only the final linear classification head.
 
 **Hyperparameters:**
+
 - Optimizer: AdamW
 - Learning Rate: 5e-5
 - Weight Decay: 0.01
@@ -109,6 +110,18 @@ Models are fine-tuned by freezing the pretrained backbone and training only the 
 Evaluated on the 10-class Emognition dataset (3-fold subject-exclusive cross-validation). Distillation yields a ~15% performance gain over random frame sampling.
 
 | Architecture | Overall Accuracy | Macro F1-Score |
-|---|---|---|
-| TimeSformer | 98.61% | 98.52% |
-| ViViT | 99.59% | 99.64% |
+| ------------ | ---------------- | -------------- |
+| TimeSformer  | 98.61%           | 98.52%         |
+| ViViT        | 99.59%           | 99.64%         |
+
+## 📝 Citation
+
+If you utilize this codebase or our data distillation methodology, please cite:
+
+```bibtex
+@article{roodaki2024emotion,
+  title={Emotion-Guided Data Distillation for Spatio-Temporal Feature Learning in Video Transformer-Based Facial Expression Recognition},
+  author={Roodaki, AmirHossein and Sotoodeh, Mahmood and Moosavi, Mohammad R. and Mbilinyi, Ashery},
+  year={2024}
+}
+```

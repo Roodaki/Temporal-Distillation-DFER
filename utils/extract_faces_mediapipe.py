@@ -1,94 +1,97 @@
 import os
 from typing import Optional
-import concurrent
 import cv2
 from glob import glob
 import mediapipe as mp
-from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
+from multiprocessing import Pool
+import time
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+INPUT_DIR = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW"
+OUTPUT_DIR = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face"
+# ──────────────────────────────────────────────────────────────────────────────
+
+PARAMS = {
+    "detection_confidence": 0.5,
+    "model_selection": 0,
+    "output_size": (224, 224),
+    "padding_ratio": 0.1,
+    "codec": "mp4v",
+    "fps": None,
+    "show_progress": False,
+    "skip_missing_faces": True,
+    "min_output_frames": 1,
+}
 
 
-def process_directory(
-    input_dir: str, output_dir: str, max_workers: Optional[int] = None
-) -> None:
-    """
-    Process all MP4 videos in a directory with face cropping using multiprocessing
+def collect_tasks(input_root: str, output_root: str) -> list:
+    tasks = []
+    for class_name in sorted(os.listdir(input_root)):
+        class_input_dir = os.path.join(input_root, class_name)
+        class_output_dir = os.path.join(output_root, class_name)
 
-    Args:
-        input_dir: Directory containing input videos
-        output_dir: Directory to save processed videos
-        max_workers: Number of parallel processes (default: CPU count)
-    """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
+        if not os.path.isdir(class_input_dir):
+            continue
 
-    # Get all mp4 files in directory
-    video_files = glob(os.path.join(input_dir, "*.mp4"))
-    video_files = [f for f in video_files if "_face.mp4" not in f]
+        os.makedirs(class_output_dir, exist_ok=True)
 
-    print(f"Found {len(video_files)} videos to process")
-
-    # Create process pool
-    num_workers = max_workers or multiprocessing.cpu_count()
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # Create list of tasks
-        tasks = [
-            (
-                vf,
-                output_dir,
-                {
-                    "detection_confidence": 0.5,
-                    "model_selection": 0,
-                    "output_size": (448, 448),
-                    "padding_ratio": 0.0,
-                    "codec": "mp4v",
-                    "fps": None,
-                    "show_progress": False,
-                    "skip_missing_faces": True,
-                },
-            )
-            for vf in video_files
+        videos = [
+            f
+            for f in glob(os.path.join(class_input_dir, "*.mp4"))
+            if "_face.mp4" not in f
         ]
 
-        # Submit all tasks
-        futures = [executor.submit(process_single_video, *task) for task in tasks]
+        # Sort by file size descending — process longest videos first
+        # so large jobs don't end up at the tail and stall completion
+        videos.sort(key=lambda f: os.path.getsize(f), reverse=True)
 
-        # Monitor progress
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                result = future.result()
-                if result:
-                    print(f"Completed: {result}")
-            except Exception as e:
-                print(f"Error processing video: {str(e)}")
+        for vf in videos:
+            tasks.append((vf, class_output_dir, PARAMS))
+
+        print(f"  [{class_name}] {len(videos)} videos queued")
+
+    return tasks
 
 
-def process_single_video(input_path: str, output_dir: str, params: dict) -> str:
+def process_single_video(args: tuple) -> dict:
     """
-    Process a single video with error handling
-    Returns the processed filename if successful
+    Worker function. Returns a result dict instead of raising,
+    so failures don't kill the whole pool.
     """
-    # Create output filename
+    input_path, output_dir, params = args
     input_filename = os.path.basename(input_path)
     base_name = os.path.splitext(input_filename)[0]
-    output_path = os.path.join(output_dir, f"{base_name}_face.mp4")
+    output_path = os.path.join(output_dir, f"{base_name}.mp4")
+
+    # Skip if already processed with real content
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 10_000:
+        return {"status": "skipped", "file": input_filename}
 
     try:
-        print(f"Starting processing: {input_filename}")
-        detect_and_crop_face(
-            input_video_path=input_path, output_video_path=output_path, **params
+        frames_written = detect_and_crop_face(
+            input_video_path=input_path,
+            output_video_path=output_path,
+            **{k: v for k, v in params.items() if k != "min_output_frames"},
         )
 
-        # Verify output
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            return f"Success: {input_filename} -> {os.path.basename(output_path)}"
-        raise RuntimeError("Output file verification failed")
+        min_frames = params.get("min_output_frames", 1)
+
+        if frames_written < min_frames:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            return {
+                "status": "no_face",
+                "file": input_filename,
+                "frames": frames_written,
+            }
+
+        return {"status": "ok", "file": input_filename, "frames": frames_written}
 
     except Exception as e:
-        # Clean up failed output
         if os.path.exists(output_path):
             os.remove(output_path)
-        raise RuntimeError(f"Failed {input_filename}: {str(e)}") from e
+        return {"status": "error", "file": input_filename, "error": str(e)}
 
 
 def detect_and_crop_face(
@@ -96,47 +99,34 @@ def detect_and_crop_face(
     output_video_path: str,
     detection_confidence: float = 0.5,
     model_selection: int = 0,
-    output_size: tuple = (448, 448),
-    padding_ratio: float = 0.0,
+    output_size: tuple = (224, 224),
+    padding_ratio: float = 0.1,
     codec: str = "mp4v",
     fps: Optional[float] = None,
-    show_progress: bool = True,
+    show_progress: bool = False,
     skip_missing_faces: bool = True,
-) -> None:
-    """
-    Detects and crops faces from a video using MediaPipe's face detection model.
-
-    Args:
-        input_video_path: Path to input video file
-        output_video_path: Path to save output video
-        detection_confidence: Minimum confidence threshold for face detection (0.0-1.0)
-        model_selection: MediaPipe model selection (0=short-range, 1=long-range)
-        output_size: Output frame dimensions (width, height)
-        padding_ratio: Additional padding around detected face (relative to face size)
-        codec: Output video codec (fourcc format)
-        fps: Optional output FPS (uses input FPS if None)
-        show_progress: Print processing progress
-        skip_missing_faces: Skip frames with no detection instead of raising error
-    """
-    # Initialize MediaPipe Face Detection
+) -> int:
+    """Returns the number of frames successfully written."""
     mp_face_detection = mp.solutions.face_detection
     face_detection = mp_face_detection.FaceDetection(
         model_selection=model_selection, min_detection_confidence=detection_confidence
     )
 
-    # Open input video
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open video: {input_video_path}")
 
-    # Get video properties
     input_fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    # Set output FPS and initialize writer
-    output_fps = fps if fps is not None else input_fps
+    output_fps = fps if fps is not None else (input_fps if input_fps > 0 else 25.0)
     fourcc = cv2.VideoWriter_fourcc(*codec)
     out = cv2.VideoWriter(output_video_path, fourcc, output_fps, output_size)
+
+    if not out.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not open VideoWriter for: {output_video_path}")
+
+    frames_written = 0
 
     try:
         for frame_num in range(total_frames):
@@ -144,15 +134,12 @@ def detect_and_crop_face(
             if not ret:
                 break
 
-            # Detect faces in RGB frame
             results = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
             if results.detections:
-                # Get first face (assumed to be main subject)
                 bbox = results.detections[0].location_data.relative_bounding_box
                 ih, iw = frame.shape[:2]
 
-                # Calculate padded bounding box
                 x = int(bbox.xmin * iw)
                 y = int(bbox.ymin * ih)
                 w = int(bbox.width * iw)
@@ -163,29 +150,75 @@ def detect_and_crop_face(
                 x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
                 x2, y2 = min(iw, x + w + pad_x), min(ih, y + h + pad_y)
 
-                # Crop and resize face region
                 cropped = frame[y1:y2, x1:x2]
                 if cropped.size == 0:
                     if skip_missing_faces:
                         continue
-                    raise ValueError(f"Invalid face crop in frame {frame_num}")
+                    raise ValueError(f"Invalid face crop at frame {frame_num}")
 
-                resized = cv2.resize(cropped, output_size)
-                out.write(resized)
+                out.write(cv2.resize(cropped, output_size))
+                frames_written += 1
 
                 if show_progress:
-                    print(f"Processed frame {frame_num+1}/{total_frames}", end="\r")
+                    print(f"  Frame {frame_num+1}/{total_frames}", end="\r")
             else:
                 if not skip_missing_faces:
-                    raise ValueError(f"No face detected in frame {frame_num}")
+                    raise ValueError(f"No face detected at frame {frame_num}")
     finally:
         cap.release()
         out.release()
+        face_detection.close()
+
+    return frames_written
 
 
 if __name__ == "__main__":
-    # Example usage
-    process_directory(
-        input_dir=r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Facial Emotion Recognition (FER)\Dataset\rotated",
-        output_dir=r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Facial Emotion Recognition (FER)\Dataset\rotated_face",
-    )
+    multiprocessing.set_start_method("spawn", force=True)
+
+    print(f"Scanning: {INPUT_DIR}")
+    tasks = collect_tasks(INPUT_DIR, OUTPUT_DIR)
+    total = len(tasks)
+    print(f"\nTotal videos to process: {total}")
+
+    # Use all cores — Pool with imap_unordered gives the best dynamic scheduling:
+    # as soon as any worker finishes a video it immediately picks up the next one,
+    # no worker ever sits idle while tasks remain in the queue.
+    num_workers = multiprocessing.cpu_count()
+    print(f"Using {num_workers} workers\n")
+
+    done, ok, skipped, no_face, failed = 0, 0, 0, 0, 0
+    start = time.time()
+
+    with Pool(processes=num_workers) as pool:
+        for result in pool.imap_unordered(process_single_video, tasks, chunksize=1):
+            done += 1
+            status = result["status"]
+
+            if status == "ok":
+                ok += 1
+            elif status == "skipped":
+                skipped += 1
+            elif status == "no_face":
+                no_face += 1
+            elif status == "error":
+                failed += 1
+                print(f"  [ERROR] {result['file']}: {result.get('error')}")
+
+            # Progress every 50 videos
+            if done % 50 == 0 or done == total:
+                elapsed = time.time() - start
+                rate = done / elapsed
+                eta = (total - done) / rate if rate > 0 else 0
+                print(
+                    f"  [{done}/{total}] "
+                    f"ok={ok} skipped={skipped} no_face={no_face} errors={failed} | "
+                    f"{rate:.1f} vid/s | ETA {eta/60:.1f} min"
+                )
+
+    elapsed = time.time() - start
+    print(f"\n✓ Done in {elapsed/60:.1f} min:")
+    print(f"   {ok} processed successfully")
+    print(f"   {skipped} skipped (already existed)")
+    print(f"   {no_face} deleted (no face detected)")
+    print(f"   {failed} errors")
+    print(f"\nOutput: {OUTPUT_DIR}")
