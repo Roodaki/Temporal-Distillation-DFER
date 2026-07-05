@@ -1,3 +1,4 @@
+import argparse
 import os
 import csv
 import cv2
@@ -156,9 +157,22 @@ def save_imagenet_style_videos_to_csv(dataset_root, output_csv_path):
     print(f"CSV saved to: {output_csv_path}")
 
 
-# --- Replace this with your dataset root ---
-dataset_root = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face"
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Report per-video duration/resolution stats for an ImageNet-style video dataset"
+    )
+    parser.add_argument(
+        "--dataset_root",
+        type=str,
+        required=True,
+        help="ImageNet-style root of class-labeled videos to inspect.",
+    )
+    parser.add_argument(
+        "--output_csv",
+        type=str,
+        default="./imagenet_style_video_dataset_info.csv",
+        help="Path to write the resulting CSV report to.",
+    )
+    args = parser.parse_args()
 
-output_csv_file = "./imagenet_style_video_dataset_info.csv"
-
-save_imagenet_style_videos_to_csv(dataset_root, output_csv_file)
+    save_imagenet_style_videos_to_csv(args.dataset_root, args.output_csv)

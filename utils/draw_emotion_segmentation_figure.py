@@ -1,3 +1,4 @@
+import argparse
 import os
 import numpy as np
 import pandas as pd
@@ -9,8 +10,6 @@ from tqdm import tqdm
 # ======================================
 # CONFIGURATION
 # ======================================
-root_dir = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Video Facial Emotion Recognition (VFER)\Dataset\rotated_face224_analyze"  # 🔸 update this path
-
 # Configuration for automatic peak segment detection
 MIN_CONSECUTIVE_FRAMES = 1
 CLASS_TO_EMOTION_MAP = {
@@ -207,62 +206,77 @@ def plot_emotion_timeline(df, save_path=None, dark_mode=False):
 
 
 # ======================================
-# MAIN LOOP: Find the most diverse video - UNCHANGED
+# MAIN LOOP: Find the most diverse video
 # ======================================
-most_diverse_file = None
-highest_score = -1
-most_diverse_df = None
-most_diverse_metrics = None
-csv_files = [
-    os.path.join(r, f)
-    for r, _, fs in os.walk(root_dir)
-    for f in fs
-    if f.endswith(".csv")
-]
-if not csv_files:
-    print("⚠️ No valid CSV files found.")
-    exit()
-for csv_path in tqdm(csv_files, desc="Processing CSVs"):
-    metrics, df = compute_diversity(csv_path)
-    if isinstance(metrics, dict) and metrics["score"] > highest_score:
-        highest_score = metrics["score"]
-        most_diverse_file = csv_path
-        most_diverse_df = df
-        most_diverse_metrics = metrics
+def main(root_dir: str) -> None:
+    most_diverse_file = None
+    highest_score = -1
+    most_diverse_df = None
+    most_diverse_metrics = None
+    csv_files = [
+        os.path.join(r, f)
+        for r, _, fs in os.walk(root_dir)
+        for f in fs
+        if f.endswith(".csv")
+    ]
+    if not csv_files:
+        print("⚠️ No valid CSV files found.")
+        return
 
-# ======================================
-# MODIFIED OUTPUT RESULT - UNCHANGED
-# ======================================
-if most_diverse_file:
-    print(f"\n🎬 Most diverse video found:\n   {most_diverse_file}")
-    print(
-        f"📊 Shannon Entropy: {most_diverse_metrics['entropy']:.4f}\n"
-        f"🔄 Transition Rate: {most_diverse_metrics['transition_rate']:.4f}\n"
-        f"📈 Diversity Score: {most_diverse_metrics['score']:.4f}\n"
-    )
+    for csv_path in tqdm(csv_files, desc="Processing CSVs"):
+        metrics, df = compute_diversity(csv_path)
+        if isinstance(metrics, dict) and metrics["score"] > highest_score:
+            highest_score = metrics["score"]
+            most_diverse_file = csv_path
+            most_diverse_df = df
+            most_diverse_metrics = metrics
 
-    target_emotion = get_target_emotion_from_path(most_diverse_file)
-    print(f"🎯 Target emotion from file path: '{target_emotion}'")
-
-    if target_emotion:
-        peak_segments = find_peak_emotion_segments(
-            most_diverse_df, target_emotion, MIN_CONSECUTIVE_FRAMES
+    if most_diverse_file:
+        print(f"\n🎬 Most diverse video found:\n   {most_diverse_file}")
+        print(
+            f"📊 Shannon Entropy: {most_diverse_metrics['entropy']:.4f}\n"
+            f"🔄 Transition Rate: {most_diverse_metrics['transition_rate']:.4f}\n"
+            f"📈 Diversity Score: {most_diverse_metrics['score']:.4f}\n"
         )
-        if peak_segments:
-            print(
-                f"🔍 Found {len(peak_segments)} peak segments (>= {MIN_CONSECUTIVE_FRAMES} frames)."
+
+        target_emotion = get_target_emotion_from_path(most_diverse_file)
+        print(f"🎯 Target emotion from file path: '{target_emotion}'")
+
+        if target_emotion:
+            peak_segments = find_peak_emotion_segments(
+                most_diverse_df, target_emotion, MIN_CONSECUTIVE_FRAMES
             )
-            save_path = (
-                os.path.splitext(most_diverse_file)[0] + "_peak_segments_timeline.png"
-            )
-            plot_timeline_with_masked_segments(
-                most_diverse_df, peak_segments, target_emotion, save_path=save_path
-            )
+            if peak_segments:
+                print(
+                    f"🔍 Found {len(peak_segments)} peak segments (>= {MIN_CONSECUTIVE_FRAMES} frames)."
+                )
+                save_path = (
+                    os.path.splitext(most_diverse_file)[0]
+                    + "_peak_segments_timeline.png"
+                )
+                plot_timeline_with_masked_segments(
+                    most_diverse_df, peak_segments, target_emotion, save_path=save_path
+                )
+            else:
+                print(
+                    f"⚠️ No segments of '{target_emotion}' found meeting the {MIN_CONSECUTIVE_FRAMES}-frame minimum."
+                )
         else:
-            print(
-                f"⚠️ No segments of '{target_emotion}' found meeting the {MIN_CONSECUTIVE_FRAMES}-frame minimum."
-            )
+            print("⚠️ Could not determine target emotion from file path.")
     else:
-        print("⚠️ Could not determine target emotion from file path.")
-else:
-    print("⚠️ No valid CSV files were successfully processed.")
+        print("⚠️ No valid CSV files were successfully processed.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Visualize emotion-guided temporal segmentation for the most diverse analyzed video"
+    )
+    parser.add_argument(
+        "--root_dir",
+        type=str,
+        default="./data/csv_logs",
+        help="Root of per-video emotion CSV logs produced by analyze_videos.py.",
+    )
+    args = parser.parse_args()
+
+    main(args.root_dir)

@@ -1,3 +1,4 @@
+import argparse
 import os
 import shutil
 import re  # Import regular expressions module
@@ -93,12 +94,24 @@ def organize_videos_by_class(source_directory, destination_root_directory):
 
 # --- Execution ---
 if __name__ == "__main__":
-    # Your updated paths
-    source_directory_path = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Video Facial Emotion Recognition (VFER)\Dataset\rotated_face224_random_trimmed8"
+    parser = argparse.ArgumentParser(
+        description="Organize trimmed clips into class-based subfolders by filename"
+    )
+    parser.add_argument(
+        "--source_dir",
+        type=str,
+        required=True,
+        help="Directory containing *_trimmed_N.mp4 / *_rnd_N.mp4 clips to organize.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Root directory where class-based subfolders will be created.",
+    )
+    args = parser.parse_args()
 
-    destination_root_directory_path = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Video Facial Emotion Recognition (VFER)\Dataset\rotated_face224_random_trimmed8_organized"
-
-    if os.path.exists(source_directory_path):
-        organize_videos_by_class(source_directory_path, destination_root_directory_path)
+    if os.path.exists(args.source_dir):
+        organize_videos_by_class(args.source_dir, args.output_dir)
     else:
-        print(f"Source directory not found: {source_directory_path}")
+        print(f"Source directory not found: {args.source_dir}")
