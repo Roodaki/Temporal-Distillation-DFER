@@ -1,13 +1,10 @@
+import argparse
 import cv2
 import pandas as pd
 import os
 import pathlib
 import time
 import multiprocessing as mp
-
-source_videos_directory = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face"
-pre_analyzed_data_directory = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face_analyze"
-trimmed_output_directory = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face_trimmed32"
 
 CLASS_TO_EMOTION_MAP = {
     "angry": "angry",
@@ -22,7 +19,6 @@ CLASS_TO_EMOTION_MAP = {
 VIDEO_EXTENSIONS = [".mp4"]
 EMOTIONS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
 
-TRIM_WINDOW_SIZE = 32
 NUM_TOP_SEGMENTS_TO_SELECT = 3
 MINIMUM_SCORE_FOR_TOP_N_THRESHOLD = 1.0
 
@@ -244,17 +240,49 @@ def process_single_video_worker(task_args_tuple):
     return summary
 
 
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Emotion-guided temporal distillation")
+    parser.add_argument(
+        "--source_dir",
+        type=str,
+        default="./data/cropped_faces",
+        help="ImageNet-style root of cropped-face videos (input to analyze_videos.py).",
+    )
+    parser.add_argument(
+        "--logs",
+        type=str,
+        default="./data/csv_logs",
+        help="Root of per-video emotion CSV logs produced by analyze_videos.py.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./data/distilled_clips_emotion",
+        help="Where emotion-guided trimmed clips are written.",
+    )
+    parser.add_argument(
+        "--clip_length",
+        type=int,
+        default=16,
+        help="Number of frames per distilled clip (e.g. 16 for ViViT, 8 for TimeSformer).",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         print("Start method already set or cannot be forced. Continuing...")
 
+    args = get_args()
+    TRIM_WINDOW_SIZE = args.clip_length
+
     start_time_script = time.time()
 
-    source_videos_root = pathlib.Path(source_videos_directory)
-    pre_analyzed_root = pathlib.Path(pre_analyzed_data_directory)
-    trimmed_output_root = pathlib.Path(trimmed_output_directory)
+    source_videos_root = pathlib.Path(args.source_dir)
+    pre_analyzed_root = pathlib.Path(args.logs)
+    trimmed_output_root = pathlib.Path(args.output_dir)
 
     if not source_videos_root.is_dir():
         print(f"Error: Source videos directory not found: {source_videos_root}")

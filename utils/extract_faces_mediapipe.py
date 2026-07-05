@@ -1,3 +1,4 @@
+import argparse
 import os
 from typing import Optional
 import cv2
@@ -6,11 +7,6 @@ import mediapipe as mp
 import multiprocessing
 from multiprocessing import Pool
 import time
-
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-INPUT_DIR = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW"
-OUTPUT_DIR = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face"
-# ──────────────────────────────────────────────────────────────────────────────
 
 PARAMS = {
     "detection_confidence": 0.5,
@@ -172,8 +168,29 @@ def detect_and_crop_face(
     return frames_written
 
 
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="MediaPipe face ROI extraction")
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        default="./data/raw_videos",
+        help="ImageNet-style root of raw class-labeled videos.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./data/cropped_faces",
+        help="Where cropped-face videos are written, mirroring the class structure.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
+
+    args = get_args()
+    INPUT_DIR = args.input_dir
+    OUTPUT_DIR = args.output_dir
 
     print(f"Scanning: {INPUT_DIR}")
     tasks = collect_tasks(INPUT_DIR, OUTPUT_DIR)

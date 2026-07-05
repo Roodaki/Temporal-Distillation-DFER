@@ -21,12 +21,9 @@ import multiprocessing as mp
 import time
 import pathlib
 import traceback
+import argparse
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-INPUT_DIR = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face"
-
-OUTPUT_DIR = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face_analyze"
-
 # IMPORTANT:
 # Use "skip" only if videos are already face-cropped.
 # Since your input folder is DFEW_face, this is likely appropriate.
@@ -281,9 +278,30 @@ def _save_plots(df: pd.DataFrame, video_name: str, output_dir: pathlib.Path) -> 
         plt.close()
 
 
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="DeepFace emotion analysis")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="./data/cropped_faces",
+        help="ImageNet-style root of cropped-face videos to analyze.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="./data/csv_logs",
+        help="Where per-video emotion CSV logs (and plots) are written.",
+    )
+    return parser.parse_args()
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
+
+    args = get_args()
+    INPUT_DIR = args.data_dir
+    OUTPUT_DIR = args.output
 
     input_root = pathlib.Path(INPUT_DIR)
     output_root = pathlib.Path(OUTPUT_DIR)

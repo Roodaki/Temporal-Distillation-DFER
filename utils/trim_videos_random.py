@@ -1,3 +1,4 @@
+import argparse
 import cv2
 import os
 import pathlib
@@ -5,11 +6,7 @@ import time
 import numpy as np
 import multiprocessing as mp
 
-source_videos_directory = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face"
-trimmed_output_directory = r"C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\2. Video Facial Emotion Recognition (VFER)\Dataset\DFEW_face_random_trimmed32"
-
 VIDEO_EXTENSIONS = [".mp4", ".avi", ".mov"]
-TRIM_WINDOW_SIZE = 32
 NUM_SEGMENTS_TO_SAMPLE = 1
 FOURCC_CODEC = cv2.VideoWriter_fourcc(*"mp4v")
 OUTPUT_VIDEO_EXTENSION = ".mp4"
@@ -144,16 +141,42 @@ def process_single_video_random_worker(task_args_tuple):
     )
 
 
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Random temporal trimming baseline")
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        default="./data/cropped_faces",
+        help="ImageNet-style root of cropped-face videos.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./data/distilled_clips_random",
+        help="Where randomly trimmed clips are written.",
+    )
+    parser.add_argument(
+        "--clip_length",
+        type=int,
+        default=16,
+        help="Number of frames per random clip (e.g. 16 for ViViT, 8 for TimeSformer).",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
 
+    args = get_args()
+    TRIM_WINDOW_SIZE = args.clip_length
+
     start_script = time.time()
 
-    source_root = pathlib.Path(source_videos_directory)
-    output_root = pathlib.Path(trimmed_output_directory)
+    source_root = pathlib.Path(args.input_dir)
+    output_root = pathlib.Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
     if not source_root.is_dir():
