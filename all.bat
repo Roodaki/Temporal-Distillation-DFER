@@ -1,15 +1,15 @@
 @echo off
-REM Batch script to run Python files in sequence
+REM Batch script to run the full pipeline in sequence.
+REM Assumes this script lives in the project root, with 'utils' as a subdirectory.
+
+SET "ROOT=%~dp0"
 
 echo Starting video processing pipeline...
-
-REM Assuming this script is in the project's root directory,
-REM and 'utils' and 'models' are subdirectories.
 
 echo ------------------------------------
 echo Step 1: Running extract_faces_mediapipe.py...
 echo ------------------------------------
-python "C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Facial Emotion Recognition (FER)\Codebase\utils\extract_faces_mediapipe.py"
+python "%ROOT%utils\extract_faces_mediapipe.py"
 
 REM Check if the previous script was successful
 IF ERRORLEVEL 1 (
@@ -20,7 +20,7 @@ IF ERRORLEVEL 1 (
 echo ------------------------------------
 echo Step 2: Running analyze_videos.py...
 echo ------------------------------------
-python "C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Facial Emotion Recognition (FER)\Codebase\utils\analyze_videos.py"
+python "%ROOT%utils\analyze_videos.py"
 
 REM Check if the previous script was successful
 IF ERRORLEVEL 1 (
@@ -29,19 +29,19 @@ IF ERRORLEVEL 1 (
 )
 
 echo ------------------------------------
-echo Step 2: Running trim_videos.py...
+echo Step 3: Running trim_videos_emotion.py...
 echo ------------------------------------
-python "C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Facial Emotion Recognition (FER)\Codebase\utils\trim_videos.py"
+python "%ROOT%utils\trim_videos_emotion.py"
 
 IF ERRORLEVEL 1 (
-  echo Error: trim_videos.py failed. Exiting.
+  echo Error: trim_videos_emotion.py failed. Exiting.
   goto :eof
 )
 
 echo ------------------------------------
-echo Step 3: Running organize_videos.py...
+echo Step 4: Running organize_videos.py...
 echo ------------------------------------
-python "C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Facial Emotion Recognition (FER)\Codebase\utils\organize_videos.py"
+python "%ROOT%utils\organize_videos.py"
 
 IF ERRORLEVEL 1 (
   echo Error: organize_videos.py failed. Exiting.
@@ -49,12 +49,22 @@ IF ERRORLEVEL 1 (
 )
 
 echo ------------------------------------
-echo Step 4: Running timesformer.py...
+echo Step 5: Running timesformer_train_offline.py...
 echo ------------------------------------
-python "C:\Users\Digi Max\Desktop\AmirHossein\University\Shiraz University\Research\Projects\Facial Emotion Recognition (FER)\Codebase\models\timesformer\timesformer-train.py"
+python "%ROOT%utils\timesformer_train_offline.py"
 
 IF ERRORLEVEL 1 (
-  echo Error: models\timesformer.py failed. Exiting.
+  echo Error: timesformer_train_offline.py failed. Exiting.
+  goto :eof
+)
+
+echo ------------------------------------
+echo Step 6: Running vivit_train_offline.py...
+echo ------------------------------------
+python "%ROOT%utils\vivit_train_offline.py"
+
+IF ERRORLEVEL 1 (
+  echo Error: vivit_train_offline.py failed. Exiting.
   goto :eof
 )
 
