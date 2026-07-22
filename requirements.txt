@@ -3,15 +3,14 @@
 # Then install the rest of the pipeline dependencies:
 #   pip install -r requirements.txt
 
-deepface>=0.0.79
-mediapipe>=0.10
-opencv-python>=4.8
-pandas>=2.0
-numpy>=1.24
-matplotlib>=3.7
-seaborn>=0.12
-scipy>=1.10
-scikit-learn>=1.2
-transformers>=4.30
-huggingface_hub>=0.24
-tqdm>=4.65
+deepface
+opencv-python
+pandas
+numpy
+matplotlib
+seaborn
+scipy
+scikit-learn
+transformers
+huggingface_hub
+tqdm
