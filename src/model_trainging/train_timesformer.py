@@ -1,11 +1,6 @@
-from __future__ import annotations
-
 import os
 
 os.environ["DECORD_NUM_THREADS"] = "1"
-
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import csv
 import json
@@ -23,9 +18,8 @@ import seaborn as sns
 from collections import Counter
 
 from transformers import (
-    VivitImageProcessor,  # <-- FIX: use directly instead of AutoImageProcessor
-    VivitConfig,  # <-- PERF: config-only load, avoids loading full weights just to read config
-    VivitForVideoClassification,
+    AutoImageProcessor,
+    TimesformerForVideoClassification,
     get_cosine_schedule_with_warmup,
     logging as hf_logging,
 )
@@ -54,18 +48,13 @@ except ImportError:
 
 
 def set_seed(seed=42):
-    """Sets seeds for reproducibility.
-
-    NOTE: cudnn.benchmark is set to True for speed (cuDNN auto-tunes convolution
-    algorithms for fixed input shapes). If you need bit-exact reproducibility,
-    set cudnn.deterministic=True and cudnn.benchmark=False instead.
-    """
+    """Sets seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def atomic_save(checkpoint, save_path):
@@ -101,9 +90,7 @@ def log_metrics_to_csv(log_path, metrics_data):
 
 
 def filter_none_collate(batch):
-    """
-    Custom collate to drop 'None' samples (corrupt videos).
-    """
+    """Drop corrupt video samples from a batch."""
     batch = [x for x in batch if x is not None]
     if len(batch) == 0:
         return None
@@ -128,81 +115,14 @@ def compute_class_weights(dataset_indices, full_dataset, num_classes):
     return torch.FloatTensor(weights)
 
 
-def validate_local_model_dir(model_path):
-    """Validate that the local Hugging Face model directory exists offline."""
-    if not os.path.isdir(model_path):
-        raise FileNotFoundError(
-            f"Offline model directory not found: {model_path}\n"
-            "Download it first on an internet-connected machine, for example:\n"
-            "  hf download google/vivit-b-16x2-kinetics400 "
-            "--local-dir ./vivit-b-16x2-kinetics400\n"
-            "Then run this script with:\n"
-            "  python vivit_train_offline.py "
-            "--model_name ./vivit-b-16x2-kinetics400"
-        )
-
-    required_any_weight = [
-        "pytorch_model.bin",
-        "model.safetensors",
-        "tf_model.h5",
-        "flax_model.msgpack",
-    ]
-    required_files = ["config.json", "preprocessor_config.json"]
-
-    missing = [
-        filename
-        for filename in required_files
-        if not os.path.exists(os.path.join(model_path, filename))
-    ]
-
-    has_weight = any(
-        os.path.exists(os.path.join(model_path, filename))
-        for filename in required_any_weight
-    )
-
-    if missing or not has_weight:
-        details = []
-        if missing:
-            details.append(f"missing required files: {missing}")
-        if not has_weight:
-            details.append(
-                "missing model weights: expected one of " f"{required_any_weight}"
-            )
-        raise FileNotFoundError(
-            f"The offline model directory is incomplete: {model_path}\n"
-            + "; ".join(details)
-        )
+def load_processor(model_name):
+    """Load the TimeSformer image processor (from the Hub or a local path)."""
+    return AutoImageProcessor.from_pretrained(model_name)
 
 
-def load_processor_offline(model_path):
-    """
-    Load the ViViT image processor without internet access.
-    Uses VivitImageProcessor directly to bypass the Auto-class registry
-    lookup, which requires an 'image_processor_type' key in
-    preprocessor_config.json that older model downloads may lack.
-    """
-    validate_local_model_dir(model_path)
-    return VivitImageProcessor.from_pretrained(
-        model_path,
-        local_files_only=True,
-    )
-
-
-def load_vivit_config_offline(model_path):
-    """
-    PERF: Load only the model config (no weights) from a local directory.
-    Used in main() to read num_frames / image_size without paying the cost
-    of loading the full ~300 MB weight file that would otherwise be discarded
-    immediately.
-    """
-    validate_local_model_dir(model_path)
-    return VivitConfig.from_pretrained(model_path, local_files_only=True)
-
-
-def load_vivit_offline(model_path, num_classes=None):
-    """Load ViViT from a local directory only."""
-    validate_local_model_dir(model_path)
-    kwargs = {"local_files_only": True}
+def load_timesformer(model_name, num_classes=None):
+    """Load TimeSformer (from the Hub or a local path)."""
+    kwargs = {}
     if num_classes is not None:
         kwargs.update(
             {
@@ -210,22 +130,22 @@ def load_vivit_offline(model_path, num_classes=None):
                 "ignore_mismatched_sizes": True,
             }
         )
-    return VivitForVideoClassification.from_pretrained(model_path, **kwargs)
+    return TimesformerForVideoClassification.from_pretrained(model_name, **kwargs)
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description="ViViT 80-20 Split Training")
+    parser = argparse.ArgumentParser(description="TimeSformer 80-20 Split Training")
 
     parser.add_argument(
         "--data_dir",
         type=str,
         default="./data/distilled_clips_emotion",
-        help="ImageNet-style root of distilled clips to train on (16-frame clips for ViViT).",
+        help="ImageNet-style root of distilled clips to train on (8-frame clips for TimeSformer).",
     )
     parser.add_argument(
         "--save_dir",
         type=str,
-        default="./checkpoints/vivit",
+        default="./checkpoints/timesformer",
         help="Directory to write model checkpoints to.",
     )
 
@@ -240,10 +160,10 @@ def get_args():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="./vivit-b-16x2-kinetics400",
+        default="facebook/timesformer-base-finetuned-k400",
         help=(
-            "Local path to the already-downloaded ViViT Hugging Face model "
-            "directory. Example: ./vivit-b-16x2-kinetics400"
+            "Hugging Face Hub model id (or local path) for TimeSformer. "
+            "Downloaded automatically (and cached) if not already present locally."
         ),
     )
     parser.add_argument("--num_classes", type=int, default=7)
@@ -280,7 +200,7 @@ class EmotionDataset(Dataset):
         self.target_image_size = target_image_size
         self.video_files = []
         self.label_map = {}
-        self.cache_path = os.path.join(root_dir, ".vivit_dataset_cache.json")
+        self.cache_path = os.path.join(root_dir, ".timesformer_dataset_cache.json")
 
         if os.path.exists(self.cache_path) and not force_rescan:
             print(f"Loading dataset from cache: {self.cache_path}")
@@ -377,16 +297,18 @@ class EmotionDataset(Dataset):
         return len(self.video_files)
 
 
-def train_epoch(model, loader, optimizer, scheduler, criterion, device, args, scaler):
+def train_epoch(model, loader, optimizer, scheduler, criterion, device, args):
     model.train()
     running_loss = 0.0
-    preds_list, labels_list = [], []
+    preds_all, labels_all = [], []
     skipped_batches = 0
 
     device_type = device.type  # "cuda" or "cpu"
     use_amp = device_type == "cuda"
 
-    optimizer.zero_grad(set_to_none=True)
+    scaler = torch.amp.GradScaler(device_type, enabled=use_amp)
+
+    optimizer.zero_grad()
     pbar = tqdm(loader, desc="Train", leave=False)
 
     for step, batch in enumerate(pbar):
@@ -408,14 +330,13 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device, args, sc
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad(set_to_none=True)  # PERF: set_to_none=True
+            optimizer.zero_grad()
             scheduler.step()
 
         running_loss += loss.item() * args.grad_accum_steps
-
         _, preds = torch.max(outputs.detach(), 1)
-        preds_list.append(preds.cpu())  # PERF: stay as tensor, avoid per-batch numpy()
-        labels_list.append(labels.cpu())
+        preds_all.extend(preds.cpu().numpy())
+        labels_all.extend(labels.cpu().numpy())
         pbar.set_postfix({"loss": f"{loss.item()*args.grad_accum_steps:.4f}"})
 
     remainder = (len(loader) - skipped_batches) % args.grad_accum_steps
@@ -424,31 +345,20 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device, args, sc
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
-        optimizer.zero_grad(set_to_none=True)  # PERF: set_to_none=True
+        optimizer.zero_grad()
         scheduler.step()
-
-    if labels_list:
-        preds_all = torch.cat(preds_list).numpy()
-        labels_all = torch.cat(labels_list).numpy()
-    else:
-        preds_all, labels_all = [], []
 
     return (
         running_loss / len(loader) if len(loader) > 0 else 0,
-        accuracy_score(labels_all, preds_all) if len(labels_all) > 0 else 0,
-        (
-            f1_score(labels_all, preds_all, average="weighted")
-            if len(labels_all) > 0
-            else 0
-        ),
+        accuracy_score(labels_all, preds_all) if labels_all else 0,
+        f1_score(labels_all, preds_all, average="weighted") if labels_all else 0,
         skipped_batches,
     )
 
 
 def validate(model, loader, criterion, device):
     model.eval()
-    running_loss = 0.0
-    preds_list, labels_list = [], []
+    running_loss, preds_all, labels_all = 0.0, [], []
     device_type = device.type
     use_amp = device_type == "cuda"
 
@@ -466,14 +376,11 @@ def validate(model, loader, criterion, device):
 
             running_loss += loss.item()
             _, preds = torch.max(outputs, 1)
-            preds_list.append(preds.cpu())  # PERF: tensor accumulation
-            labels_list.append(labels.cpu())
+            preds_all.extend(preds.cpu().numpy())
+            labels_all.extend(labels.cpu().numpy())
 
-    if not labels_list:
+    if not labels_all:
         return 0.0, 0.0, 0.0
-
-    preds_all = torch.cat(preds_list).numpy()
-    labels_all = torch.cat(labels_list).numpy()
 
     return (
         running_loss / len(loader),
@@ -485,7 +392,7 @@ def validate(model, loader, criterion, device):
 def save_test_results(model, loader, device, label_map, save_dir):
     print("\nRunning predictions on Held-out Test Set...")
     model.eval()
-    preds_list, labels_list = [], []
+    preds_all, labels_all = [], []
     device_type = device.type
     use_amp = device_type == "cuda"
 
@@ -500,16 +407,12 @@ def save_test_results(model, loader, device, label_map, save_dir):
                 outputs = model(pixel_values).logits
 
             _, preds = torch.max(outputs, 1)
-            preds_list.append(preds.cpu())  # PERF: tensor accumulation
-            labels_list.append(labels.cpu())
-
-    preds_all = torch.cat(preds_list).numpy()
-    labels_all = torch.cat(labels_list).numpy()
+            preds_all.extend(preds.cpu().numpy())
+            labels_all.extend(labels.cpu().numpy())
 
     acc = accuracy_score(labels_all, preds_all)
     f1 = f1_score(labels_all, preds_all, average="weighted")
     print(f"HELD-OUT TEST RESULT -> Acc: {acc:.4f} | F1: {f1:.4f}")
-
     class_names = [k for k, v in sorted(label_map.items(), key=lambda item: item[1])]
     report_dict = classification_report(
         labels_all, preds_all, target_names=class_names, output_dict=True
@@ -587,7 +490,6 @@ def run_train(args, full_dataset, train_indices_full, device):
         num_workers=args.num_workers,
         collate_fn=filter_none_collate,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,  # PERF
     )
     val_loader = DataLoader(
         val_sub,
@@ -596,18 +498,13 @@ def run_train(args, full_dataset, train_indices_full, device):
         num_workers=args.num_workers,
         collate_fn=filter_none_collate,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,  # PERF
     )
 
     print("Initializing Model...")
-    model = load_vivit_offline(args.model_name, args.num_classes)
+    model = load_timesformer(args.model_name, args.num_classes)
 
     model.gradient_checkpointing_enable()
     model.to(device)
-
-    if hasattr(torch, "compile"):
-        print("Applying torch.compile() for faster execution...")
-        model = torch.compile(model)
 
     backbone_params = [p for n, p in model.named_parameters() if "classifier" not in n]
     head_params = [p for n, p in model.named_parameters() if "classifier" in n]
@@ -627,18 +524,15 @@ def run_train(args, full_dataset, train_indices_full, device):
         weight=class_weights, label_smoothing=args.label_smoothing
     )
 
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(args.save_dir, f"vivit_train_log_{timestamp}.csv")
+    log_file = os.path.join(args.save_dir, f"timesformer_train_log_{timestamp}.csv")
     best_val_f1 = 0.0
     patience_counter = 0
     best_model_path = os.path.join(args.save_dir, "best_model.pth")
 
     for epoch in range(args.epochs):
         t_loss, t_acc, t_f1, skipped = train_epoch(
-            model, train_loader, optimizer, scheduler, criterion, device, args, scaler
+            model, train_loader, optimizer, scheduler, criterion, device, args
         )
         v_loss, v_acc, v_f1 = validate(model, val_loader, criterion, device)
 
@@ -666,8 +560,7 @@ def run_train(args, full_dataset, train_indices_full, device):
         if v_f1 > best_val_f1:
             best_val_f1 = v_f1
             patience_counter = 0
-            raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-            atomic_save(raw_model.state_dict(), best_model_path)
+            atomic_save(model.state_dict(), best_model_path)
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
@@ -681,8 +574,7 @@ def run_train(args, full_dataset, train_indices_full, device):
         return {"acc": 0.0, "f1": 0.0}, best_model_path
 
     print("Reloading best model for verification...")
-    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-    raw_model.load_state_dict(
+    model.load_state_dict(
         torch.load(best_model_path, map_location=device, weights_only=True)
     )
     _, final_acc, final_f1 = validate(model, val_loader, criterion, device)
@@ -702,12 +594,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(
-        f"--- ViViT 80-20 Split Training ---\nModel: {args.model_name}\nVal Split: {args.val_split}\nDevice: {device}"
+        f"--- TimeSformer 80-20 Split Training ---\nModel: {args.model_name}\nVal Split: {args.val_split}\nDevice: {device}"
     )
-    print("Offline mode: enabled. Loading model and processor from local files only.")
 
-    processor = load_processor_offline(args.model_name)
-    temp_conf = load_vivit_config_offline(args.model_name)
+    processor = load_processor(args.model_name)
+    temp_conf = load_timesformer(args.model_name).config
 
     dataset = EmotionDataset(
         args.data_dir,
@@ -736,7 +627,6 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=filter_none_collate,
-        persistent_workers=args.num_workers > 0,  # PERF
     )
 
     print(f"Data Distribution: CV Pool={len(cv_indices)}, Test Set={len(test_indices)}")
@@ -749,15 +639,16 @@ def main():
     print(f"Val Accuracy: {result['acc']:.4f}")
     print(f"Val F1-Score: {result['f1']:.4f}")
 
-    with open(os.path.join(args.save_dir, "final_vivit_summary.txt"), "w") as f:
+    with open(os.path.join(args.save_dir, "final_timesformer_summary.txt"), "w") as f:
         f.write(f"Val Accuracy: {result['acc']:.4f}\n")
         f.write(f"Val F1-Score: {result['f1']:.4f}\n")
 
+    # Final Evaluation on held-out test set
     print(f"\nEvaluating Best Model on Held-out Test Set...")
     if not os.path.exists(best_model_path):
         print("WARNING: no best model checkpoint found. Skipping test evaluation.")
         return
-    model = load_vivit_offline(args.model_name, args.num_classes).to(device)
+    model = load_timesformer(args.model_name, args.num_classes).to(device)
     model.load_state_dict(
         torch.load(best_model_path, map_location=device, weights_only=True)
     )
