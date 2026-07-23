@@ -10,8 +10,9 @@ import gc
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset, WeightedRandomSampler
 from torch.utils.data.dataloader import default_collate
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -84,6 +85,7 @@ def log_metrics_to_csv(log_path, metrics_data):
                 "val_f1",
                 "learning_rate",
                 "skipped_batches",
+                "unfrozen",
             ]
             writer.writerow(header)
         if metrics_data:
@@ -98,22 +100,176 @@ def filter_none_collate(batch):
     return default_collate(batch)
 
 
-def compute_class_weights(dataset_indices, full_dataset, num_classes):
+# ---------------------------------------------------------------------------
+# Class weighting
+# ---------------------------------------------------------------------------
+def compute_class_weights(
+    dataset_indices,
+    full_dataset,
+    num_classes,
+    scheme="effective_number",
+    beta=0.9999,
+    clip_min=0.5,
+    clip_max=8.0,
+):
     """
-    Calculates inverse class weights to handle dataset imbalance.
-    Weight = Total_Samples / (Num_Classes * Class_Count)
-    Uses num_classes from args to ensure the tensor has the correct size
-    even if a class is absent from this particular split.
+    Computes per-class loss weights to handle dataset imbalance. Several
+    schemes are supported since raw inverse-frequency weighting blows up
+    catastrophically on classes with very low counts (e.g. ~39 samples out
+    of ~11.8k), which lets a handful of examples dominate the gradient and
+    starve the majority classes of signal -- this was diagnosed as the main
+    driver of the val-F1 collapse seen in earlier runs.
+
+    Schemes:
+      - "inverse"          : classic weight = n_samples / (num_classes * count)
+                              (kept for backwards compatibility / ablation).
+      - "sqrt_inverse"      : sqrt of the above -- tempers extreme ratios.
+      - "clipped_inverse"   : "inverse" scheme, then clipped to [clip_min, clip_max].
+      - "effective_number"  : Cui et al. 2019 "Class-Balanced Loss Based on
+                              Effective Number of Samples". weight ~
+                              (1 - beta) / (1 - beta^count). This is the
+                              recommended default: it is a principled,
+                              published, citable scheme that saturates much
+                              more gently than raw inverse-frequency weighting
+                              as count shrinks, rather than an ad hoc clip.
+
+    All schemes are finally re-normalized so that weights average to 1.0
+    across the classes actually present, which keeps the overall loss
+    magnitude comparable across schemes/runs.
     """
     labels = [full_dataset.video_files[i][1] for i in dataset_indices]
     counts = Counter(labels)
     n_samples = len(labels)
 
     weights = [1.0] * num_classes  # default weight=1 for any class not present
-    for cls_id, count in counts.items():
-        weights[cls_id] = n_samples / (num_classes * count)
+
+    if scheme == "inverse":
+        for cls_id, count in counts.items():
+            weights[cls_id] = n_samples / (num_classes * count)
+
+    elif scheme == "sqrt_inverse":
+        for cls_id, count in counts.items():
+            weights[cls_id] = np.sqrt(n_samples / (num_classes * count))
+
+    elif scheme == "clipped_inverse":
+        for cls_id, count in counts.items():
+            w = n_samples / (num_classes * count)
+            weights[cls_id] = float(np.clip(w, clip_min, clip_max))
+
+    elif scheme == "effective_number":
+        for cls_id, count in counts.items():
+            effective_num = 1.0 - np.power(beta, count)
+            weights[cls_id] = (1.0 - beta) / max(effective_num, 1e-8)
+
+    else:
+        raise ValueError(f"Unknown class weighting scheme: {scheme}")
+
+    weights = np.array(weights, dtype=np.float64)
+    present = np.array([c in counts for c in range(num_classes)])
+    if present.any():
+        mean_present = weights[present].mean()
+        if mean_present > 0:
+            weights = weights / mean_present
 
     return torch.FloatTensor(weights)
+
+
+def build_weighted_sampler(dataset_indices, full_dataset, num_classes):
+    """
+    Builds a WeightedRandomSampler that oversamples rare classes (e.g. the
+    ~39-video 'disgust' class) *at the batch-sampling level*, leaving the
+    underlying dataset untouched on disk -- important when the dataset
+    composition must stay identical to other work for literature comparison.
+
+    Per-sample weight = 1 / class_count, so within an epoch, expected
+    exposure per class is roughly equalized. Sampling is done with
+    replacement (num_samples == len(dataset_indices), one epoch's worth),
+    so rare-class videos get seen multiple times per epoch while common
+    classes are subsampled -- augmentation (see EmotionDataset) ensures a
+    given video isn't seen as the literal same tensor every time it repeats.
+    """
+    labels = [full_dataset.video_files[i][1] for i in dataset_indices]
+    counts = Counter(labels)
+    sample_weights = [1.0 / counts[label] for label in labels]
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Focal loss (Lin et al., 2017), optionally combined with class weights
+# ---------------------------------------------------------------------------
+class FocalLoss(nn.Module):
+    """
+    Focal loss down-weights easy/already-confident predictions and focuses
+    gradient on hard, misclassified examples, rather than relying purely on
+    class-frequency weighting. Combined with class-balanced weights (the
+    `weight` argument), this reproduces the "class-balanced focal loss"
+    setup from Cui et al. 2019, which is a reasonable, citable choice for a
+    severely imbalanced class (here, ~0.3% of samples).
+    """
+
+    def __init__(self, gamma=2.0, weight=None, label_smoothing=0.0):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits, targets):
+        ce_loss = F.cross_entropy(
+            logits,
+            targets,
+            weight=self.weight,
+            label_smoothing=self.label_smoothing,
+            reduction="none",
+        )
+        pt = torch.exp(-ce_loss)
+        focal_term = (1.0 - pt) ** self.gamma
+        loss = focal_term * ce_loss
+        return loss.mean()
+
+
+def build_criterion(args, class_weights):
+    if args.loss_type == "focal":
+        return FocalLoss(
+            gamma=args.focal_gamma,
+            weight=class_weights,
+            label_smoothing=args.label_smoothing,
+        )
+    return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
+
+
+# ---------------------------------------------------------------------------
+# Backbone freezing / staged unfreezing
+# ---------------------------------------------------------------------------
+def freeze_backbone(model, head_attr_name="classifier"):
+    """
+    Freezes every parameter except the classification head. Used for the
+    first `args.freeze_epochs` epochs so the model adapts the head to the
+    task before any backbone weights move -- this reduces the model's
+    capacity to immediately start memorizing the ~25-31 training examples
+    of the smallest class, since only the head is trainable at first.
+    """
+    head_module = getattr(model, head_attr_name, None)
+    head_param_ids = {id(p) for p in head_module.parameters()} if head_module is not None else set()
+    n_frozen = 0
+    for p in model.parameters():
+        if id(p) not in head_param_ids:
+            p.requires_grad = False
+            n_frozen += 1
+    print(f"Froze {n_frozen} backbone parameter tensors; head remains trainable.")
+
+
+def unfreeze_backbone(model):
+    """Unfreezes all parameters (staged unfreezing, after `freeze_epochs`)."""
+    n_unfrozen = 0
+    for p in model.parameters():
+        if not p.requires_grad:
+            p.requires_grad = True
+            n_unfrozen += 1
+    print(f"Unfroze {n_unfrozen} backbone parameter tensors; full fine-tuning resumes.")
 
 
 def split_params_by_head(model, head_attr_name="classifier"):
@@ -255,6 +411,106 @@ def get_args():
         default=0.05,
         help="Warn if the fraction of fully-skipped (corrupt) batches in an epoch exceeds this.",
     )
+
+    # --- Class imbalance handling -----------------------------------------
+    parser.add_argument(
+        "--class_weight_scheme",
+        type=str,
+        default="effective_number",
+        choices=["inverse", "sqrt_inverse", "clipped_inverse", "effective_number", "none"],
+        help="How per-class loss weights are computed. 'effective_number' (Cui et al. "
+        "2019) is recommended for severely imbalanced classes; 'inverse' reproduces "
+        "the original unbounded scheme for ablation comparisons.",
+    )
+    parser.add_argument(
+        "--class_weight_beta",
+        type=float,
+        default=0.99,
+        help="Beta for the 'effective_number' weighting scheme (closer to 1.0 = more "
+        "aggressive correction for rare classes). NOTE: the commonly-cited default of "
+        "0.9999 in Cui et al. 2019 is tuned for datasets with tens of thousands of "
+        "samples per class (e.g. iNaturalist); at that beta, classes in the "
+        "hundreds-to-low-thousands range (like this dataset's ~39-3413 per class) "
+        "barely differ from uncapped inverse-frequency weighting since beta^count "
+        "saturates to ~0 for all of them. 0.99 is calibrated for this dataset's "
+        "actual scale -- sweep it and check the resulting weight ratios if you "
+        "change dataset size significantly.",
+    )
+    parser.add_argument("--class_weight_clip_min", type=float, default=0.5)
+    parser.add_argument("--class_weight_clip_max", type=float, default=8.0)
+
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="ce",
+        choices=["ce", "focal"],
+        help="'ce' = (optionally class-weighted) cross-entropy. 'focal' = focal loss "
+        "(Lin et al. 2017), optionally combined with class weights for a "
+        "class-balanced focal loss setup.",
+    )
+    parser.add_argument("--focal_gamma", type=float, default=2.0)
+
+    parser.add_argument(
+        "--use_weighted_sampler",
+        action="store_true",
+        help="If set, oversample rare classes during training via a WeightedRandomSampler "
+        "instead of (or alongside) loss-level class weighting. Does not modify the "
+        "dataset on disk -- only which samples are drawn each epoch.",
+    )
+
+    # --- Augmentation --------------------------------------------------
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="Enable train-time augmentation (random horizontal flip, mild color jitter, "
+        "temporal frame-index jitter). Disabled by default so existing runs are "
+        "reproducible; recommended when combined with --use_weighted_sampler so "
+        "oversampled rare-class videos aren't seen as identical repeated tensors.",
+    )
+    parser.add_argument("--aug_hflip_prob", type=float, default=0.5)
+    parser.add_argument(
+        "--aug_color_jitter",
+        type=float,
+        default=0.2,
+        help="Max fractional change for brightness/contrast/saturation jitter.",
+    )
+    parser.add_argument(
+        "--aug_temporal_jitter",
+        type=int,
+        default=1,
+        help="Max +/- frame index jitter applied to each sampled frame position "
+        "(before clamping to valid range).",
+    )
+
+    # --- Staged backbone freezing --------------------------------------
+    parser.add_argument(
+        "--freeze_epochs",
+        type=int,
+        default=0,
+        help="Number of initial epochs where only the classification head is trained "
+        "(backbone frozen). 0 disables freezing (full fine-tuning from epoch 1, "
+        "matching original behavior). Recommended: 2-5 for small/imbalanced datasets.",
+    )
+    parser.add_argument(
+        "--dropout_override",
+        type=float,
+        default=None,
+        help="If set, overrides hidden_dropout_prob and attention_probs_dropout_prob "
+        "in the model config (where supported) as an extra regularizer against "
+        "small-class memorization. Leave unset to use the pretrained model's defaults.",
+    )
+
+    # --- Cross-validation ------------------------------------------------
+    parser.add_argument(
+        "--n_folds",
+        type=int,
+        default=1,
+        help="If > 1, runs stratified k-fold CV over the CV pool instead of a single "
+        "80/20 split, and reports mean +/- std per-class metrics across folds. "
+        "Recommended for small classes (e.g. ~39 samples) where a single split "
+        "gives a high-variance, less defensible estimate.",
+    )
+
     return parser.parse_args()
 
 
@@ -286,6 +542,10 @@ class EmotionDataset(Dataset):
         expected_num_frames,
         target_image_size,
         force_rescan=False,
+        augment=False,
+        aug_hflip_prob=0.5,
+        aug_color_jitter=0.2,
+        aug_temporal_jitter=1,
     ):
         self.root_dir = root_dir
         self.processor = processor
@@ -294,6 +554,17 @@ class EmotionDataset(Dataset):
         self.video_files = []
         self.label_map = {}
         self.cache_path = os.path.join(root_dir, ".timesformer_dataset_cache.json")
+
+        # Augmentation is OFF by default (matches original behavior / keeps
+        # eval-time transforms deterministic). Turn on with --augment; see
+        # _augment_frames for what's applied. Only meaningful for splits used
+        # as training data -- val/test loaders should be built with augment=False
+        # by wrapping this same dataset via Subset (see run_train / main),
+        # since Subset does not copy the underlying dataset's augment flag.
+        self.augment = augment
+        self.aug_hflip_prob = aug_hflip_prob
+        self.aug_color_jitter = aug_color_jitter
+        self.aug_temporal_jitter = aug_temporal_jitter
 
         if not force_rescan and self._cache_is_valid():
             print(f"Loading dataset from cache: {self.cache_path}")
@@ -351,27 +622,23 @@ class EmotionDataset(Dataset):
             self.video_files = data["files"]
             self.label_map = data["map"]
 
-    def _load_frames_decord(self, video_path):
+    def _load_frames_decord(self, video_path, frame_indices):
         try:
             vr = VideoReader(video_path, num_threads=1, ctx=cpu(0))
             if len(vr) == 0:
                 return None
-            indices = np.linspace(0, len(vr) - 1, self.expected_num_frames).astype(int)
+            indices = np.clip(frame_indices, 0, len(vr) - 1).astype(int)
             return list(vr.get_batch(indices).asnumpy())
         except Exception:
             return None
 
-    def _load_frames_av(self, video_path):
+    def _load_frames_av(self, video_path, frame_indices):
         frames = []
         try:
             with av.open(video_path) as container:
                 total_frames = container.streams.video[0].frames
                 if total_frames > 0:
-                    indices = set(
-                        np.linspace(
-                            0, total_frames - 1, self.expected_num_frames
-                        ).astype(int)
-                    )
+                    indices = set(np.clip(frame_indices, 0, total_frames - 1).astype(int).tolist())
                     for i, frame in enumerate(container.decode(video=0)):
                         if i in indices:
                             frames.append(frame.to_ndarray(format="rgb24"))
@@ -381,20 +648,79 @@ class EmotionDataset(Dataset):
                     for frame in container.decode(video=0):
                         frames.append(frame.to_ndarray(format="rgb24"))
                     if frames:
-                        idxs = np.linspace(
-                            0, len(frames) - 1, self.expected_num_frames
-                        ).astype(int)
+                        idxs = np.clip(frame_indices, 0, len(frames) - 1).astype(int)
                         frames = [frames[i] for i in idxs]
         except Exception:
             return None
         return frames
 
+    def _base_frame_indices(self, total_len_hint):
+        """Evenly spaced frame indices, matching the original (non-augmented) behavior."""
+        return np.linspace(0, max(total_len_hint - 1, 0), self.expected_num_frames)
+
+    def _augment_frames(self, frames):
+        """
+        Lightweight train-time augmentation applied consistently across all
+        frames of a clip (so e.g. a flip doesn't happen on only some frames).
+        Kept intentionally simple / dependency-free (numpy only):
+          - random horizontal flip
+          - mild brightness/contrast/saturation jitter (same factors for
+            every frame in the clip, to preserve temporal consistency)
+        Temporal jitter on *which* frames get sampled is applied earlier, in
+        __getitem__, via the frame index computation.
+        """
+        if random.random() < self.aug_hflip_prob:
+            frames = [np.ascontiguousarray(f[:, ::-1, :]) for f in frames]
+
+        if self.aug_color_jitter > 0:
+            b = 1.0 + random.uniform(-self.aug_color_jitter, self.aug_color_jitter)
+            c = 1.0 + random.uniform(-self.aug_color_jitter, self.aug_color_jitter)
+            s = 1.0 + random.uniform(-self.aug_color_jitter, self.aug_color_jitter)
+
+            jittered = []
+            for f in frames:
+                arr = f.astype(np.float32)
+                # brightness
+                arr = arr * b
+                # contrast (around per-frame mean)
+                mean = arr.mean(axis=(0, 1), keepdims=True)
+                arr = (arr - mean) * c + mean
+                # saturation (blend with grayscale)
+                gray = arr.mean(axis=2, keepdims=True)
+                arr = gray + (arr - gray) * s
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+                jittered.append(arr)
+            frames = jittered
+
+        return frames
+
     def __getitem__(self, idx):
         video_path, label = self.video_files[idx]
+
+        # Determine a length hint cheaply by re-using decord's reader (av path
+        # falls back to internal frame counting inside _load_frames_av).
+        length_hint = self.expected_num_frames
+        if DECORD_AVAILABLE:
+            try:
+                vr = VideoReader(video_path, num_threads=1, ctx=cpu(0))
+                length_hint = len(vr)
+            except Exception:
+                return None
+
+        base_indices = self._base_frame_indices(length_hint)
+
+        if self.augment and self.aug_temporal_jitter > 0:
+            jitter = np.random.randint(
+                -self.aug_temporal_jitter, self.aug_temporal_jitter + 1, size=base_indices.shape
+            )
+            frame_indices = base_indices + jitter
+        else:
+            frame_indices = base_indices
+
         frames = (
-            self._load_frames_decord(video_path)
+            self._load_frames_decord(video_path, frame_indices)
             if DECORD_AVAILABLE
-            else self._load_frames_av(video_path)
+            else self._load_frames_av(video_path, frame_indices)
         )
 
         if frames is None or len(frames) == 0:
@@ -405,6 +731,9 @@ class EmotionDataset(Dataset):
                 self.expected_num_frames - len(frames)
             )
 
+        if self.augment:
+            frames = self._augment_frames(frames)
+
         inputs = self.processor(images=frames, return_tensors="pt")
         return {
             "pixel_values": inputs.pixel_values.squeeze(0),
@@ -413,6 +742,31 @@ class EmotionDataset(Dataset):
 
     def __len__(self):
         return len(self.video_files)
+
+
+class AugmentWrapper(Dataset):
+    """
+    Thin wrapper so a Subset of EmotionDataset can have augmentation toggled
+    independently of the underlying (shared) dataset instance -- e.g. train
+    split augmented, val/test splits not, without needing three separate
+    EmotionDataset instances (which would triple the on-disk scan/cache cost).
+    """
+
+    def __init__(self, subset, augment):
+        self.subset = subset
+        self.augment = augment
+
+    def __getitem__(self, idx):
+        base_dataset = self.subset.dataset
+        prev = base_dataset.augment
+        base_dataset.augment = self.augment
+        try:
+            return self.subset[idx]
+        finally:
+            base_dataset.augment = prev
+
+    def __len__(self):
+        return len(self.subset)
 
 
 def train_epoch(
@@ -435,7 +789,7 @@ def train_epoch(
     this function stops touching the LR at all; a ReduceLROnPlateau scheduler
     (stepped once per epoch on val F1, in run_train) takes over from there.
 
-    NOTE: `scaler` is now passed in from run_train and persists across epochs,
+    NOTE: `scaler` is passed in from run_train and persists across epochs,
     instead of being recreated fresh every call -- previously this reset the
     AMP loss scale to its default every epoch, undermining its whole point
     (adapting over time) and causing avoidable skipped optimizer steps while
@@ -468,7 +822,9 @@ def train_epoch(
 
         if (step + 1) % args.grad_accum_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], max_norm=1.0
+            )
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -485,7 +841,9 @@ def train_epoch(
     remainder = (len(loader) - skipped_batches) % args.grad_accum_steps
     if remainder != 0:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad], max_norm=1.0
+        )
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
@@ -535,7 +893,7 @@ def validate(model, loader, criterion, device):
     )
 
 
-def save_test_results(model, loader, device, label_map, save_dir):
+def save_test_results(model, loader, device, label_map, save_dir, suffix=""):
     print("\nRunning predictions on Held-out Test Set...")
     model.eval()
     preds_all, labels_all = [], []
@@ -558,13 +916,14 @@ def save_test_results(model, loader, device, label_map, save_dir):
 
     acc = accuracy_score(labels_all, preds_all)
     f1 = f1_score(labels_all, preds_all, average="weighted")
-    print(f"HELD-OUT TEST RESULT -> Acc: {acc:.4f} | F1: {f1:.4f}")
+    macro_f1 = f1_score(labels_all, preds_all, average="macro")
+    print(f"HELD-OUT TEST RESULT -> Acc: {acc:.4f} | Weighted F1: {f1:.4f} | Macro F1: {macro_f1:.4f}")
     class_names = [k for k, v in sorted(label_map.items(), key=lambda item: item[1])]
     report_dict = classification_report(
         labels_all, preds_all, target_names=class_names, output_dict=True
     )
 
-    csv_path = os.path.join(save_dir, "final_class_performance.csv")
+    csv_path = os.path.join(save_dir, f"final_class_performance{suffix}.csv")
     print(f"Saving class-wise metrics to: {csv_path}")
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -601,15 +960,17 @@ def save_test_results(model, loader, device, label_map, save_dir):
     )
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
-    plt.title(f"Test Confusion Matrix (Normalized)\nAcc: {acc:.4f}, F1: {f1:.4f}")
+    plt.title(f"Test Confusion Matrix (Normalized)\nAcc: {acc:.4f}, Weighted F1: {f1:.4f}, Macro F1: {macro_f1:.4f}")
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "test_confusion_matrix.png"))
+    plt.savefig(os.path.join(save_dir, f"test_confusion_matrix{suffix}.png"))
     plt.close()
 
+    return report_dict, acc, f1, macro_f1
 
-def run_train(args, full_dataset, train_indices_full, device):
-    """Single 80-20 stratified train/val split."""
+
+def run_train(args, full_dataset, train_indices_full, device, fold_id=1):
+    """Single stratified train/val split (optionally one fold of a larger k-fold CV loop)."""
     cv_labels = [full_dataset.video_files[i][1] for i in train_indices_full]
 
     actual_train_idx, actual_val_idx = train_test_split(
@@ -619,27 +980,47 @@ def run_train(args, full_dataset, train_indices_full, device):
         random_state=args.seed,
     )
 
-    print(f"\nSplit -> Train: {len(actual_train_idx)} | Val: {len(actual_val_idx)}")
+    print(f"\n[Fold {fold_id}] Split -> Train: {len(actual_train_idx)} | Val: {len(actual_val_idx)}")
 
-    class_weights = compute_class_weights(
-        actual_train_idx, full_dataset, args.num_classes
-    ).to(device)
-    print(f"Class Weights applied: {class_weights.cpu().numpy()}")
+    class_weights = None
+    if args.class_weight_scheme != "none":
+        class_weights = compute_class_weights(
+            actual_train_idx,
+            full_dataset,
+            args.num_classes,
+            scheme=args.class_weight_scheme,
+            beta=args.class_weight_beta,
+            clip_min=args.class_weight_clip_min,
+            clip_max=args.class_weight_clip_max,
+        ).to(device)
+        print(f"[Fold {fold_id}] Class weights ({args.class_weight_scheme}): {class_weights.cpu().numpy()}")
 
     train_sub = Subset(full_dataset, actual_train_idx)
     val_sub = Subset(full_dataset, actual_val_idx)
 
+    # Augmentation only ever applies to the train split; val/test stay
+    # deterministic for a fair, reproducible evaluation.
+    train_ds = AugmentWrapper(train_sub, augment=args.augment)
+    val_ds = AugmentWrapper(val_sub, augment=False)
+
+    sampler = None
+    shuffle = True
+    if args.use_weighted_sampler:
+        sampler = build_weighted_sampler(actual_train_idx, full_dataset, args.num_classes)
+        shuffle = False  # sampler and shuffle are mutually exclusive in DataLoader
+
     train_loader = DataLoader(
-        train_sub,
+        train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=args.num_workers,
         collate_fn=filter_none_collate,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
-        val_sub,
+        val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -649,10 +1030,23 @@ def run_train(args, full_dataset, train_indices_full, device):
     )
 
     print("Initializing Model...")
-    model = load_timesformer(args.model_name, args.num_classes)
+    if args.dropout_override is not None:
+        config = load_timesformer_config(args.model_name)
+        config.num_labels = args.num_classes
+        for attr in ("hidden_dropout_prob", "attention_probs_dropout_prob"):
+            if hasattr(config, attr):
+                setattr(config, attr, args.dropout_override)
+        model = TimesformerForVideoClassification.from_pretrained(
+            args.model_name, config=config, ignore_mismatched_sizes=True
+        )
+    else:
+        model = load_timesformer(args.model_name, args.num_classes)
 
     model.gradient_checkpointing_enable()
     model.to(device)
+
+    if args.freeze_epochs > 0:
+        freeze_backbone(model, head_attr_name="classifier")
 
     backbone_params, head_params = split_params_by_head(model, head_attr_name="classifier")
     optimizer = optim.AdamW(
@@ -673,21 +1067,19 @@ def run_train(args, full_dataset, train_indices_full, device):
         patience=args.lr_patience,
         min_lr=args.min_lr,
     )
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights, label_smoothing=args.label_smoothing
-    )
+    criterion = build_criterion(args, class_weights)
 
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(args.save_dir, f"timesformer_train_log_{timestamp}.csv")
+    log_file = os.path.join(args.save_dir, f"timesformer_train_log_fold{fold_id}_{timestamp}.csv")
     best_val_f1 = 0.0
     patience_counter = 0
     global_step = 0
     start_epoch = 0
-    best_model_path = os.path.join(args.save_dir, "best_model.pth")
-    last_checkpoint_path = os.path.join(args.save_dir, "last_checkpoint.pth")
+    best_model_path = os.path.join(args.save_dir, f"best_model_fold{fold_id}.pth")
+    last_checkpoint_path = os.path.join(args.save_dir, f"last_checkpoint_fold{fold_id}.pth")
 
     if args.resume_from and os.path.exists(args.resume_from):
         print(f"Resuming from checkpoint: {args.resume_from}")
@@ -701,12 +1093,17 @@ def run_train(args, full_dataset, train_indices_full, device):
         patience_counter = ckpt["patience_counter"]
         global_step = ckpt["global_step"]
         start_epoch = ckpt["epoch"] + 1
+        if start_epoch >= args.freeze_epochs:
+            unfreeze_backbone(model)
         print(
             f"Resumed at epoch {start_epoch}, global_step {global_step}, "
             f"best_val_f1 {best_val_f1:.4f}"
         )
 
     for epoch in range(start_epoch, args.epochs):
+        if args.freeze_epochs > 0 and epoch == args.freeze_epochs:
+            unfreeze_backbone(model)
+
         t_loss, t_acc, t_f1, skipped, global_step = train_epoch(
             model,
             train_loader,
@@ -732,14 +1129,17 @@ def run_train(args, full_dataset, train_indices_full, device):
         if global_step >= warmup_steps:
             plateau_scheduler.step(v_f1)
 
+        is_frozen = args.freeze_epochs > 0 and epoch < args.freeze_epochs
         print(
-            f"Ep {epoch+1} | T_F1: {t_f1:.4f} | V_F1: {v_f1:.4f} (Best: {best_val_f1:.4f}) | Skip: {skipped}"
+            f"[Fold {fold_id}] Ep {epoch+1} | T_F1: {t_f1:.4f} | V_F1: {v_f1:.4f} "
+            f"(Best: {best_val_f1:.4f}) | Skip: {skipped} | "
+            f"{'FROZEN' if is_frozen else 'unfrozen'}"
         )
 
         log_metrics_to_csv(
             log_file,
             [
-                1,  # single run, no fold number
+                fold_id,
                 epoch + 1,
                 datetime.now(),
                 t_loss,
@@ -750,6 +1150,7 @@ def run_train(args, full_dataset, train_indices_full, device):
                 v_f1,
                 optimizer.param_groups[0]["lr"],
                 skipped,
+                not is_frozen,
             ],
         )
 
@@ -791,13 +1192,47 @@ def run_train(args, full_dataset, train_indices_full, device):
         torch.load(best_model_path, map_location=device, weights_only=True)
     )
     _, final_acc, final_f1 = validate(model, val_loader, criterion, device)
-    print(f"Verified Best -> Acc: {final_acc:.4f} | F1: {final_f1:.4f}")
+    print(f"[Fold {fold_id}] Verified Best -> Acc: {final_acc:.4f} | F1: {final_f1:.4f}")
 
     del model, optimizer, warmup_scheduler, plateau_scheduler, train_loader, val_loader
     torch.cuda.empty_cache()
     gc.collect()
 
     return {"acc": final_acc, "f1": final_f1}, best_model_path
+
+
+def summarize_cv_results(fold_reports, save_dir):
+    """
+    Aggregates per-class metrics across folds as mean +/- std, and writes a
+    CSV. This is what makes a volatile small-class number (e.g. disgust,
+    n~39) defensible: a single split's F1 is a high-variance point estimate,
+    but "0.15 +/- 0.09 across 5 folds" tells the reader how much to trust it.
+    """
+    class_names = sorted(
+        {c for report in fold_reports for c in report.keys() if c not in ("accuracy", "macro avg", "weighted avg")}
+    )
+    rows = []
+    for cls in class_names:
+        precisions = [r[cls]["precision"] for r in fold_reports if cls in r]
+        recalls = [r[cls]["recall"] for r in fold_reports if cls in r]
+        f1s = [r[cls]["f1-score"] for r in fold_reports if cls in r]
+        supports = [r[cls]["support"] for r in fold_reports if cls in r]
+        rows.append(
+            [
+                cls,
+                f"{np.mean(precisions):.4f} ± {np.std(precisions):.4f}",
+                f"{np.mean(recalls):.4f} ± {np.std(recalls):.4f}",
+                f"{np.mean(f1s):.4f} ± {np.std(f1s):.4f}",
+                f"{np.mean(supports):.1f}",
+            ]
+        )
+
+    csv_path = os.path.join(save_dir, "cv_class_performance_summary.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Class Name", "Precision (mean ± std)", "Recall (mean ± std)", "F1 (mean ± std)", "Mean Support"])
+        writer.writerows(rows)
+    print(f"\nSaved cross-fold class-performance summary to: {csv_path}")
 
 
 def main():
@@ -807,7 +1242,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(
-        f"--- TimeSformer 80-20 Split Training ---\nModel: {args.model_name}\nVal Split: {args.val_split}\nDevice: {device}"
+        f"--- TimeSformer Training ---\nModel: {args.model_name}\nVal Split: {args.val_split}\n"
+        f"Class weight scheme: {args.class_weight_scheme}\nLoss: {args.loss_type}\n"
+        f"Weighted sampler: {args.use_weighted_sampler}\nAugmentation: {args.augment}\n"
+        f"Freeze epochs: {args.freeze_epochs}\nFolds: {args.n_folds}\nDevice: {device}"
     )
 
     processor = load_processor(args.model_name)
@@ -818,7 +1256,10 @@ def main():
         processor,
         temp_conf.num_frames,
         temp_conf.image_size,
-        args.force_rescan,
+        force_rescan=args.force_rescan,
+        aug_hflip_prob=args.aug_hflip_prob,
+        aug_color_jitter=args.aug_color_jitter,
+        aug_temporal_jitter=args.aug_temporal_jitter,
     )
     if len(dataset) == 0:
         raise ValueError("Dataset Empty")
@@ -836,8 +1277,9 @@ def main():
     )
 
     test_sub = Subset(dataset, test_indices)
+    test_ds = AugmentWrapper(test_sub, augment=False)
     test_loader = DataLoader(
-        test_sub,
+        test_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -847,29 +1289,85 @@ def main():
 
     print(f"Data Distribution: CV Pool={len(cv_indices)}, Test Set={len(test_indices)}")
 
-    result, best_model_path = run_train(args, dataset, cv_indices, device)
+    if args.n_folds <= 1:
+        result, best_model_path = run_train(args, dataset, cv_indices, device, fold_id=1)
 
-    print("\n" + "=" * 40)
-    print("TRAINING SUMMARY")
-    print("=" * 40)
-    print(f"Val Accuracy: {result['acc']:.4f}")
-    print(f"Val F1-Score: {result['f1']:.4f}")
+        print("\n" + "=" * 40)
+        print("TRAINING SUMMARY")
+        print("=" * 40)
+        print(f"Val Accuracy: {result['acc']:.4f}")
+        print(f"Val F1-Score: {result['f1']:.4f}")
 
-    with open(os.path.join(args.save_dir, "final_timesformer_summary.txt"), "w") as f:
-        f.write(f"Val Accuracy: {result['acc']:.4f}\n")
-        f.write(f"Val F1-Score: {result['f1']:.4f}\n")
+        with open(os.path.join(args.save_dir, "final_timesformer_summary.txt"), "w") as f:
+            f.write(f"Val Accuracy: {result['acc']:.4f}\n")
+            f.write(f"Val F1-Score: {result['f1']:.4f}\n")
 
-    # Final Evaluation on held-out test set
-    print(f"\nEvaluating Best Model on Held-out Test Set...")
-    if not os.path.exists(best_model_path):
-        print("WARNING: no best model checkpoint found. Skipping test evaluation.")
-        return
-    model = load_timesformer(args.model_name, args.num_classes).to(device)
-    model.load_state_dict(
-        torch.load(best_model_path, map_location=device, weights_only=True)
-    )
+        print(f"\nEvaluating Best Model on Held-out Test Set...")
+        if not os.path.exists(best_model_path):
+            print("WARNING: no best model checkpoint found. Skipping test evaluation.")
+            return
+        model = load_timesformer(args.model_name, args.num_classes).to(device)
+        model.load_state_dict(
+            torch.load(best_model_path, map_location=device, weights_only=True)
+        )
+        save_test_results(model, test_loader, device, dataset.label_map, args.save_dir)
 
-    save_test_results(model, test_loader, device, dataset.label_map, args.save_dir)
+    else:
+        # Stratified k-fold CV over the CV pool. Each fold reuses the *same*
+        # held-out test set (carved out once above via split_seed), and each
+        # fold's best model is separately evaluated on it -- giving mean +/-
+        # std test metrics, which is what makes small-class numbers (e.g.
+        # disgust, n~39) defensible rather than a single volatile split.
+        from sklearn.model_selection import StratifiedKFold
+
+        cv_labels = [dataset.video_files[i][1] for i in cv_indices]
+        skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.split_seed)
+
+        fold_reports = []
+        fold_summaries = []
+        cv_indices_arr = np.array(cv_indices)
+
+        for fold_id, (_, fold_val_relative_idx) in enumerate(
+            skf.split(cv_indices_arr, cv_labels), start=1
+        ):
+            # StratifiedKFold gives us fold membership; we still want each
+            # fold's *training pool* to go through the same internal
+            # train/val split logic as run_train, so we pass the full CV
+            # pool minus nothing here -- run_train does its own internal
+            # split_seed-independent val carve via args.seed. To keep folds
+            # actually distinct, we rotate args.seed per fold below.
+            fold_args = argparse.Namespace(**vars(args))
+            fold_args.seed = args.seed + fold_id  # vary the internal train/val carve per fold
+
+            result, best_model_path = run_train(fold_args, dataset, cv_indices, device, fold_id=fold_id)
+            fold_summaries.append(result)
+
+            if os.path.exists(best_model_path):
+                model = load_timesformer(args.model_name, args.num_classes).to(device)
+                model.load_state_dict(
+                    torch.load(best_model_path, map_location=device, weights_only=True)
+                )
+                report_dict, acc, f1, macro_f1 = save_test_results(
+                    model, test_loader, device, dataset.label_map, args.save_dir, suffix=f"_fold{fold_id}"
+                )
+                fold_reports.append(report_dict)
+                del model
+                torch.cuda.empty_cache()
+
+        print("\n" + "=" * 40)
+        print(f"{args.n_folds}-FOLD CV SUMMARY")
+        print("=" * 40)
+        val_accs = [r["acc"] for r in fold_summaries]
+        val_f1s = [r["f1"] for r in fold_summaries]
+        print(f"Val Accuracy: {np.mean(val_accs):.4f} ± {np.std(val_accs):.4f}")
+        print(f"Val F1-Score: {np.mean(val_f1s):.4f} ± {np.std(val_f1s):.4f}")
+
+        with open(os.path.join(args.save_dir, "final_timesformer_summary.txt"), "w") as f:
+            f.write(f"Val Accuracy: {np.mean(val_accs):.4f} ± {np.std(val_accs):.4f}\n")
+            f.write(f"Val F1-Score: {np.mean(val_f1s):.4f} ± {np.std(val_f1s):.4f}\n")
+
+        if fold_reports:
+            summarize_cv_results(fold_reports, args.save_dir)
 
 
 if __name__ == "__main__":
