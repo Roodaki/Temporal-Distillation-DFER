@@ -24,7 +24,7 @@ CLASS_TO_EMOTION_MAP = {
 VIDEO_EXTENSIONS = [".mp4", ".avi", ".mov"]
 EMOTIONS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
 
-NUM_TOP_SEGMENTS_TO_SELECT = 3
+NUM_TOP_SEGMENTS_TO_SELECT = 1
 MINIMUM_SCORE_FOR_TOP_N_THRESHOLD = 1.0
 
 NEUTRAL_EMOTION_COLUMN = "neutral"
@@ -668,7 +668,7 @@ def run_min_neutral_pass(args, trim_window_size):
         for folder_path in analysis_folders_found
     ]
 
-    num_processes_to_use = max(1, mp.cpu_count() - 1)
+    num_processes_to_use = int(os.environ.get("SLURM_CPUS_PER_TASK", mp.cpu_count()))
     print(f"Starting parallel processing with {num_processes_to_use} processes...")
 
     start_time_script = time.time()

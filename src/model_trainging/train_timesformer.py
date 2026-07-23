@@ -19,8 +19,9 @@ from collections import Counter
 
 from transformers import (
     AutoImageProcessor,
+    TimesformerConfig,  # <-- config-only load, avoids loading full weights just to read config
     TimesformerForVideoClassification,
-    get_cosine_schedule_with_warmup,
+    get_constant_schedule_with_warmup,  # linear warmup -> constant; plateau scheduler takes over after
     logging as hf_logging,
 )
 
@@ -115,9 +116,46 @@ def compute_class_weights(dataset_indices, full_dataset, num_classes):
     return torch.FloatTensor(weights)
 
 
+def split_params_by_head(model, head_attr_name="classifier"):
+    """
+    Split model parameters into backbone / head groups using module identity
+    (matching against the actual head submodule's parameters) rather than
+    string-matching parameter names. This is robust to internal HF naming
+    changes, unlike `"classifier" in name` substring checks.
+
+    Falls back to substring matching (with a warning) if the model has no
+    attribute called `head_attr_name`.
+    """
+    head_module = getattr(model, head_attr_name, None)
+    if head_module is not None:
+        head_param_ids = {id(p) for p in head_module.parameters()}
+        head_params = [p for p in model.parameters() if id(p) in head_param_ids]
+        backbone_params = [p for p in model.parameters() if id(p) not in head_param_ids]
+        return backbone_params, head_params
+
+    print(
+        f"WARNING: model has no attribute '{head_attr_name}'; falling back to "
+        f"name-substring matching for backbone/head param groups."
+    )
+    backbone_params = [p for n, p in model.named_parameters() if head_attr_name not in n]
+    head_params = [p for n, p in model.named_parameters() if head_attr_name in n]
+    return backbone_params, head_params
+
+
 def load_processor(model_name):
     """Load the TimeSformer image processor (from the Hub or a local path)."""
     return AutoImageProcessor.from_pretrained(model_name)
+
+
+def load_timesformer_config(model_name):
+    """
+    Load only the model config (no weights) from the Hub or a local directory.
+    Used in main() to read num_frames / image_size without paying the cost
+    of loading the full weight file that would otherwise be discarded
+    immediately (previously this script loaded the whole model just for
+    `.config`).
+    """
+    return TimesformerConfig.from_pretrained(model_name)
 
 
 def load_timesformer(model_name, num_classes=None):
@@ -175,14 +213,70 @@ def get_args():
     parser.add_argument("--lr_head", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
-    parser.add_argument("--warmup_ratio", type=float, default=0.1)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of an assumed full run used for linear LR warmup before "
+        "handing control to the plateau-based scheduler.",
+    )
+    parser.add_argument("--patience", type=int, default=5, help="Early-stopping patience (epochs).")
 
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--lr_patience",
+        type=int,
+        default=2,
+        help="Epochs of no val-F1 improvement before ReduceLROnPlateau cuts the LR.",
+    )
+    parser.add_argument("--lr_factor", type=float, default=0.5, help="Multiplicative LR reduction factor on plateau.")
+    parser.add_argument("--min_lr", type=float, default=1e-7, help="Floor for ReduceLROnPlateau.")
+
+    parser.add_argument("--seed", type=int, default=42, help="Seed for model init / training stochasticity.")
+    parser.add_argument(
+        "--split_seed",
+        type=int,
+        default=1337,
+        help="Fixed seed for the train/test carve-out, independent of --seed, "
+        "so the held-out test set doesn't move when you sweep training seeds.",
+    )
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--force_rescan", action="store_true")
 
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to a last_checkpoint.pth to resume training from (model, optimizer, "
+        "scheduler states, epoch, best_val_f1, patience counter, global step).",
+    )
+    parser.add_argument(
+        "--skip_rate_warn_threshold",
+        type=float,
+        default=0.05,
+        help="Warn if the fraction of fully-skipped (corrupt) batches in an epoch exceeds this.",
+    )
+
     return parser.parse_args()
+
+
+def _dataset_fingerprint(root_dir):
+    """
+    Cheap fingerprint (file count + summed mtimes) of the dataset directory.
+    Used to auto-invalidate the JSON scan cache when videos are added/removed/
+    modified, instead of relying on the user remembering --force_rescan.
+    Only does stat() calls -- no video decoding -- so it's fast even for
+    thousands of files.
+    """
+    total_mtime = 0
+    count = 0
+    for emotion_name in sorted(os.listdir(root_dir)):
+        d = os.path.join(root_dir, emotion_name)
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.lower().endswith(".mp4"):
+                    count += 1
+                    total_mtime += int(os.path.getmtime(os.path.join(d, f)))
+    return {"count": count, "mtime_sum": total_mtime}
 
 
 class EmotionDataset(Dataset):
@@ -202,11 +296,29 @@ class EmotionDataset(Dataset):
         self.label_map = {}
         self.cache_path = os.path.join(root_dir, ".timesformer_dataset_cache.json")
 
-        if os.path.exists(self.cache_path) and not force_rescan:
+        if not force_rescan and self._cache_is_valid():
             print(f"Loading dataset from cache: {self.cache_path}")
             self._load_cache()
         else:
+            if os.path.exists(self.cache_path) and not force_rescan:
+                print(
+                    "Dataset directory changed since cache was built (or cache "
+                    "format is outdated) -- rescanning..."
+                )
             self._scan_and_cache()
+
+    def _cache_is_valid(self):
+        if not os.path.exists(self.cache_path):
+            return False
+        try:
+            with open(self.cache_path, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return False
+        cached_fp = data.get("fingerprint")
+        if cached_fp is None:
+            return False  # old cache format predating fingerprinting
+        return cached_fp == _dataset_fingerprint(self.root_dir)
 
     def _scan_and_cache(self):
         if not os.path.exists(self.root_dir):
@@ -224,7 +336,14 @@ class EmotionDataset(Dataset):
                             (os.path.join(emotion_dir, f), current_label)
                         )
         with open(self.cache_path, "w") as f:
-            json.dump({"files": self.video_files, "map": self.label_map}, f)
+            json.dump(
+                {
+                    "files": self.video_files,
+                    "map": self.label_map,
+                    "fingerprint": _dataset_fingerprint(self.root_dir),
+                },
+                f,
+            )
         print(f"Scanned {len(self.video_files)} videos. Cache saved.")
 
     def _load_cache(self):
@@ -297,7 +416,32 @@ class EmotionDataset(Dataset):
         return len(self.video_files)
 
 
-def train_epoch(model, loader, optimizer, scheduler, criterion, device, args):
+def train_epoch(
+    model,
+    loader,
+    optimizer,
+    warmup_scheduler,
+    warmup_steps,
+    global_step,
+    criterion,
+    device,
+    args,
+    scaler,
+):
+    """
+    Runs one training epoch.
+
+    LR schedule: while `global_step < warmup_steps`, the warmup scheduler ramps
+    LR linearly from 0 -> base LR on each optimizer step. Once warmup completes,
+    this function stops touching the LR at all; a ReduceLROnPlateau scheduler
+    (stepped once per epoch on val F1, in run_train) takes over from there.
+
+    NOTE: `scaler` is now passed in from run_train and persists across epochs,
+    instead of being recreated fresh every call -- previously this reset the
+    AMP loss scale to its default every epoch, undermining its whole point
+    (adapting over time) and causing avoidable skipped optimizer steps while
+    it re-calibrated at the start of each epoch.
+    """
     model.train()
     running_loss = 0.0
     preds_all, labels_all = [], []
@@ -305,8 +449,6 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device, args):
 
     device_type = device.type  # "cuda" or "cpu"
     use_amp = device_type == "cuda"
-
-    scaler = torch.amp.GradScaler(device_type, enabled=use_amp)
 
     optimizer.zero_grad()
     pbar = tqdm(loader, desc="Train", leave=False)
@@ -331,7 +473,9 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device, args):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-            scheduler.step()
+            if global_step < warmup_steps:
+                warmup_scheduler.step()
+            global_step += 1
 
         running_loss += loss.item() * args.grad_accum_steps
         _, preds = torch.max(outputs.detach(), 1)
@@ -346,13 +490,16 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device, args):
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
-        scheduler.step()
+        if global_step < warmup_steps:
+            warmup_scheduler.step()
+        global_step += 1
 
     return (
         running_loss / len(loader) if len(loader) > 0 else 0,
         accuracy_score(labels_all, preds_all) if labels_all else 0,
         f1_score(labels_all, preds_all, average="weighted") if labels_all else 0,
         skipped_batches,
+        global_step,
     )
 
 
@@ -490,6 +637,7 @@ def run_train(args, full_dataset, train_indices_full, device):
         num_workers=args.num_workers,
         collate_fn=filter_none_collate,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_sub,
@@ -498,6 +646,7 @@ def run_train(args, full_dataset, train_indices_full, device):
         num_workers=args.num_workers,
         collate_fn=filter_none_collate,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
 
     print("Initializing Model...")
@@ -506,8 +655,7 @@ def run_train(args, full_dataset, train_indices_full, device):
     model.gradient_checkpointing_enable()
     model.to(device)
 
-    backbone_params = [p for n, p in model.named_parameters() if "classifier" not in n]
-    head_params = [p for n, p in model.named_parameters() if "classifier" in n]
+    backbone_params, head_params = split_params_by_head(model, head_attr_name="classifier")
     optimizer = optim.AdamW(
         [
             {"params": backbone_params, "lr": args.lr_backbone},
@@ -517,24 +665,73 @@ def run_train(args, full_dataset, train_indices_full, device):
     )
 
     total_steps = len(train_loader) * args.epochs // args.grad_accum_steps
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, int(args.warmup_ratio * total_steps), total_steps
+    warmup_steps = int(args.warmup_ratio * total_steps)
+    warmup_scheduler = get_constant_schedule_with_warmup(optimizer, warmup_steps)
+    plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        min_lr=args.min_lr,
     )
     criterion = nn.CrossEntropyLoss(
         weight=class_weights, label_smoothing=args.label_smoothing
     )
 
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(args.save_dir, f"timesformer_train_log_{timestamp}.csv")
     best_val_f1 = 0.0
     patience_counter = 0
+    global_step = 0
+    start_epoch = 0
     best_model_path = os.path.join(args.save_dir, "best_model.pth")
+    last_checkpoint_path = os.path.join(args.save_dir, "last_checkpoint.pth")
 
-    for epoch in range(args.epochs):
-        t_loss, t_acc, t_f1, skipped = train_epoch(
-            model, train_loader, optimizer, scheduler, criterion, device, args
+    if args.resume_from and os.path.exists(args.resume_from):
+        print(f"Resuming from checkpoint: {args.resume_from}")
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        warmup_scheduler.load_state_dict(ckpt["warmup_scheduler"])
+        plateau_scheduler.load_state_dict(ckpt["plateau_scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        best_val_f1 = ckpt["best_val_f1"]
+        patience_counter = ckpt["patience_counter"]
+        global_step = ckpt["global_step"]
+        start_epoch = ckpt["epoch"] + 1
+        print(
+            f"Resumed at epoch {start_epoch}, global_step {global_step}, "
+            f"best_val_f1 {best_val_f1:.4f}"
+        )
+
+    for epoch in range(start_epoch, args.epochs):
+        t_loss, t_acc, t_f1, skipped, global_step = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            warmup_scheduler,
+            warmup_steps,
+            global_step,
+            criterion,
+            device,
+            args,
+            scaler,
         )
         v_loss, v_acc, v_f1 = validate(model, val_loader, criterion, device)
+
+        skip_rate = skipped / len(train_loader) if len(train_loader) > 0 else 0
+        if skip_rate > args.skip_rate_warn_threshold:
+            print(
+                f"WARNING: {skip_rate:.1%} of batches were fully skipped this epoch "
+                f"(corrupt/unreadable videos) -- check data integrity."
+            )
+
+        # Once warmup is complete, let val F1 drive further LR reductions.
+        if global_step >= warmup_steps:
+            plateau_scheduler.step(v_f1)
 
         print(
             f"Ep {epoch+1} | T_F1: {t_f1:.4f} | V_F1: {v_f1:.4f} (Best: {best_val_f1:.4f}) | Skip: {skipped}"
@@ -563,9 +760,26 @@ def run_train(args, full_dataset, train_indices_full, device):
             atomic_save(model.state_dict(), best_model_path)
         else:
             patience_counter += 1
-            if patience_counter >= args.patience:
-                print("Early stopping triggered.")
-                break
+
+        # Full resumable checkpoint, saved every epoch regardless of improvement.
+        atomic_save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "warmup_scheduler": warmup_scheduler.state_dict(),
+                "plateau_scheduler": plateau_scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch": epoch,
+                "best_val_f1": best_val_f1,
+                "patience_counter": patience_counter,
+                "global_step": global_step,
+            },
+            last_checkpoint_path,
+        )
+
+        if patience_counter >= args.patience:
+            print("Early stopping triggered.")
+            break
 
     if not os.path.exists(best_model_path):
         print(
@@ -580,7 +794,7 @@ def run_train(args, full_dataset, train_indices_full, device):
     _, final_acc, final_f1 = validate(model, val_loader, criterion, device)
     print(f"Verified Best -> Acc: {final_acc:.4f} | F1: {final_f1:.4f}")
 
-    del model, optimizer, scheduler, train_loader, val_loader
+    del model, optimizer, warmup_scheduler, plateau_scheduler, train_loader, val_loader
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -598,7 +812,7 @@ def main():
     )
 
     processor = load_processor(args.model_name)
-    temp_conf = load_timesformer(args.model_name).config
+    temp_conf = load_timesformer_config(args.model_name)
 
     dataset = EmotionDataset(
         args.data_dir,
@@ -613,11 +827,13 @@ def main():
     all_indices = list(range(len(dataset)))
     all_labels = [x[1] for x in dataset.video_files]
 
+    # NOTE: split_seed is intentionally independent of --seed, so the held-out
+    # test set stays fixed even if you sweep training seeds for variance runs.
     cv_indices, test_indices = train_test_split(
         all_indices,
         test_size=args.test_split,
         stratify=all_labels,
-        random_state=args.seed,
+        random_state=args.split_seed,
     )
 
     test_sub = Subset(dataset, test_indices)
@@ -627,6 +843,7 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=filter_none_collate,
+        persistent_workers=args.num_workers > 0,
     )
 
     print(f"Data Distribution: CV Pool={len(cv_indices)}, Test Set={len(test_indices)}")
