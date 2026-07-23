@@ -206,12 +206,12 @@ def get_args():
     )
     parser.add_argument("--num_classes", type=int, default=7)
 
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
     parser.add_argument("--lr_backbone", type=float, default=2e-5)
     parser.add_argument("--lr_head", type=float, default=3e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=0.02)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument(
         "--warmup_ratio",
@@ -220,15 +220,15 @@ def get_args():
         help="Fraction of an assumed full run used for linear LR warmup before "
         "handing control to the plateau-based scheduler.",
     )
-    parser.add_argument("--patience", type=int, default=5, help="Early-stopping patience (epochs).")
+    parser.add_argument("--patience", type=int, default=15, help="Early-stopping patience (epochs).")
 
     parser.add_argument(
         "--lr_patience",
         type=int,
-        default=2,
+        default=4,
         help="Epochs of no val-F1 improvement before ReduceLROnPlateau cuts the LR.",
     )
-    parser.add_argument("--lr_factor", type=float, default=0.5, help="Multiplicative LR reduction factor on plateau.")
+    parser.add_argument("--lr_factor", type=float, default=0.3, help="Multiplicative LR reduction factor on plateau.")
     parser.add_argument("--min_lr", type=float, default=1e-7, help="Floor for ReduceLROnPlateau.")
 
     parser.add_argument("--seed", type=int, default=42, help="Seed for model init / training stochasticity.")
@@ -255,7 +255,6 @@ def get_args():
         default=0.05,
         help="Warn if the fraction of fully-skipped (corrupt) batches in an epoch exceeds this.",
     )
-
     return parser.parse_args()
 
 
