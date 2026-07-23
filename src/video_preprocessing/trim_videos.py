@@ -180,6 +180,34 @@ def evaluate_sliding_windows(
     return evaluated_segments
 
 
+def select_non_overlapping_segments(
+    ordered_segments: list[dict],
+    num_segments_to_select: int,
+) -> list[dict]:
+    """Greedy temporal non-max suppression.
+
+    `ordered_segments` must already be sorted by priority (best candidate
+    first — e.g. highest/lowest mean score, or a random shuffle). Walk the
+    list in that order; keep a candidate only if it shares no frame with any
+    segment already selected, i.e. reject it if
+    candidate.start <= chosen.end AND candidate.end >= chosen.start.
+    Stop once `num_segments_to_select` non-overlapping segments are picked
+    or the candidate list is exhausted.
+    """
+    selected_segments: list[dict] = []
+    for candidate in ordered_segments:
+        if len(selected_segments) >= num_segments_to_select:
+            break
+        overlaps_existing = any(
+            candidate["video_start_frame"] <= chosen["video_end_frame"]
+            and candidate["video_end_frame"] >= chosen["video_start_frame"]
+            for chosen in selected_segments
+        )
+        if not overlaps_existing:
+            selected_segments.append(candidate)
+    return selected_segments
+
+
 def save_qualified_segments(
     qualified_segments: list[dict],
     original_video_file: pathlib.Path,
@@ -317,9 +345,12 @@ def process_single_video_max_emotion_worker(task_args_tuple):
 
     # Highest mean target-emotion score first.
     all_evaluated_segments.sort(key=lambda x: x["mean_score"], reverse=True)
+    non_overlapping_candidates = select_non_overlapping_segments(
+        all_evaluated_segments, num_top_segments
+    )
     qualified_segments = [
         segment
-        for segment in all_evaluated_segments[:num_top_segments]
+        for segment in non_overlapping_candidates
         if segment["mean_score"] >= min_score_threshold
     ]
 
@@ -435,9 +466,12 @@ def process_single_video_min_neutral_worker(task_args_tuple):
 
     # Lowest mean neutral score first (least neutral / most expressive).
     all_evaluated_segments.sort(key=lambda x: x["mean_score"])
+    non_overlapping_candidates = select_non_overlapping_segments(
+        all_evaluated_segments, num_top_segments
+    )
     qualified_segments = [
         segment
-        for segment in all_evaluated_segments[:num_top_segments]
+        for segment in non_overlapping_candidates
         if segment["mean_score"] <= max_score_threshold
     ]
 
@@ -515,27 +549,36 @@ def process_single_video_random_worker(task_args_tuple):
             f"({total_frames} frames) for window {trim_window_size}."
         )
 
+    # Build every valid window as a candidate (same shape as the score-based
+    # workers use), then shuffle so "priority order" is random instead of
+    # score order, and run it through the same NMS-style greedy selector so
+    # random picks never overlap each other either.
     max_valid_start_index = total_frames - trim_window_size
-    actual_num_to_sample = min(num_segments, max_valid_start_index + 1)
+    all_candidate_segments = [
+        {
+            "video_start_frame": start_idx + 1,
+            "video_end_frame": start_idx + trim_window_size,
+        }
+        for start_idx in range(max_valid_start_index + 1)
+    ]
+    np.random.shuffle(all_candidate_segments)
 
-    try:
-        selected_start_indices = np.random.choice(
-            max_valid_start_index + 1, actual_num_to_sample, replace=False
-        )
-    except ValueError:
-        return f"{relative_class_dir}/{video_stem}: Error generating random indices."
-
-    selected_start_indices.sort()
+    selected_segments = select_non_overlapping_segments(
+        all_candidate_segments, num_segments
+    )
+    # Keep chronological order in the output filenames/order.
+    selected_segments.sort(key=lambda seg: seg["video_start_frame"])
 
     segments_saved_count = 0
-    for i, start_frame_idx in enumerate(selected_start_indices, start=1):
+    for i, segment_info in enumerate(selected_segments, start=1):
+        start_frame_zero_based = segment_info["video_start_frame"] - 1
         output_name = f"{video_stem}_rnd_{i}{output_video_extension}"
         output_file_path = class_output_dir / output_name
 
         ok = write_segment(
             video_path,
             output_file_path,
-            int(start_frame_idx),
+            start_frame_zero_based,
             trim_window_size,
             fps,
             frame_width,

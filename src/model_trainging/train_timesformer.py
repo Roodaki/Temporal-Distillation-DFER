@@ -363,8 +363,8 @@ def get_args():
     parser.add_argument("--num_classes", type=int, default=7)
 
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--grad_accum_steps", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--grad_accum_steps", type=int, default=8)
     parser.add_argument("--lr_backbone", type=float, default=2e-5)
     parser.add_argument("--lr_head", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.02)
@@ -416,7 +416,7 @@ def get_args():
     parser.add_argument(
         "--class_weight_scheme",
         type=str,
-        default="effective_number",
+        default="none",
         choices=["inverse", "sqrt_inverse", "clipped_inverse", "effective_number", "none"],
         help="How per-class loss weights are computed. 'effective_number' (Cui et al. "
         "2019) is recommended for severely imbalanced classes; 'inverse' reproduces "
@@ -486,7 +486,7 @@ def get_args():
     parser.add_argument(
         "--freeze_epochs",
         type=int,
-        default=0,
+        default=5,
         help="Number of initial epochs where only the classification head is trained "
         "(backbone frozen). 0 disables freezing (full fine-tuning from epoch 1, "
         "matching original behavior). Recommended: 2-5 for small/imbalanced datasets.",
