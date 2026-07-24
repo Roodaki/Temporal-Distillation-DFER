@@ -128,16 +128,23 @@ _SOURCE_ID_SUFFIXES = ["max_emotion", "min_neutral", "rnd"]
 _SOURCE_ID_PATTERNS = [
     re.compile(rf"^(.*)_{re.escape(suffix)}_\d+$") for suffix in _SOURCE_ID_SUFFIXES
 ]
+_SOURCE_ID_AND_INDEX_PATTERNS = [
+    re.compile(rf"^(.*)_{re.escape(suffix)}_(\d+)$") for suffix in _SOURCE_ID_SUFFIXES
+]
 
 
-def extract_source_id(filename):
+def extract_source_id_and_clip_index(filename):
     """
-    Extracts the original source-video stem from a distilled clip filename by
-    stripping the known trailing "_<mode>_<index>" suffix. video_stem itself
-    may contain underscores, so this anchors on the known suffix tokens
-    rather than naively splitting on the last N underscores (verified against
-    the exact naming used by save_qualified_segments / process_single_video_
-    random_worker in the preprocessing script).
+    Extracts both the original source-video stem AND the trailing per-mode
+    clip index (the integer after the mode suffix, e.g. 2 for
+    "..._max_emotion_2.mp4") from a distilled clip filename. video_stem
+    itself may contain underscores, so this anchors on the known suffix
+    tokens rather than naively splitting on the last N underscores (verified
+    against the exact naming used by save_qualified_segments /
+    process_single_video_random_worker in the preprocessing script).
+
+    extract_source_id() is implemented in terms of this function so the two
+    can never disagree about which suffix pattern matched.
 
     Raises ValueError if no known suffix pattern matches, rather than
     silently falling back to treating the clip as its own singleton group --
@@ -147,17 +154,28 @@ def extract_source_id(filename):
     a new preprocessing mode, add its suffix to _SOURCE_ID_SUFFIXES first.
     """
     stem = os.path.splitext(os.path.basename(filename))[0]
-    for pattern in _SOURCE_ID_PATTERNS:
+    for pattern in _SOURCE_ID_AND_INDEX_PATTERNS:
         m = pattern.match(stem)
         if m:
-            return m.group(1)
+            return m.group(1), int(m.group(2))
     raise ValueError(
-        f"extract_source_id: filename '{filename}' (stem '{stem}') does not match any "
-        f"known suffix pattern {_SOURCE_ID_SUFFIXES}. Refusing to silently treat this as "
-        f"an ungrouped singleton, since that could reintroduce train/val/test leakage for "
-        f"this source video. Add its suffix convention to _SOURCE_ID_SUFFIXES if this is "
+        f"extract_source_id_and_clip_index: filename '{filename}' (stem '{stem}') does not "
+        f"match any known suffix pattern {_SOURCE_ID_SUFFIXES}. Refusing to silently treat "
+        f"this as an ungrouped singleton, since that could reintroduce train/val/test leakage "
+        f"for this source video. Add its suffix convention to _SOURCE_ID_SUFFIXES if this is "
         f"a legitimate new preprocessing mode."
     )
+
+
+def extract_source_id(filename):
+    """
+    Extracts the original source-video stem from a distilled clip filename by
+    stripping the known trailing "_<mode>_<index>" suffix. See
+    extract_source_id_and_clip_index for the full explanation; this is a
+    thin wrapper that discards the clip index.
+    """
+    source_id, _clip_index = extract_source_id_and_clip_index(filename)
+    return source_id
 
 
 def build_source_groups(video_files):
@@ -214,6 +232,34 @@ def grouped_stratified_split(indices, labels, groups, test_size, random_state, n
         sgkf.split(indices, labels, groups=groups)
     )
     return indices[train_relative_idx].tolist(), indices[test_relative_idx].tolist()
+
+
+def filter_test_indices_top_clip_only(test_indices, video_files):
+    """
+    Restricts a test-index list to only the "_1" indexed clip per source
+    video, independently per mode (e.g. keeps "<stem>_max_emotion_1" and
+    "<stem>_min_neutral_1" and "<stem>_rnd_1" if all exist for a video, but
+    drops "_max_emotion_2", "_max_emotion_3", etc.). There is no meaningful
+    way to rank "_max_emotion_1" against "_rnd_1" against each other (they
+    are scored on different, incomparable criteria -- see
+    process_single_video_max_emotion_worker / _min_neutral_worker / _random_
+    worker in the preprocessing script), so "top clip" is defined per-mode,
+    not as a single global winner per video.
+
+    This only ever removes clips from the test set -- it never adds a clip,
+    never moves a clip between train/val/test, and never changes which
+    source videos are considered test videos. Because it operates on a
+    subset of an already group-disjoint split, it cannot reintroduce
+    train/val/test leakage (removing elements from one side of a disjoint
+    partition can't create overlap with the other side).
+    """
+    filtered = []
+    for idx in test_indices:
+        path, _label = video_files[idx]
+        _source_id, clip_index = extract_source_id_and_clip_index(path)
+        if clip_index == 1:
+            filtered.append(idx)
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +546,7 @@ def get_args():
         help="Fraction of an assumed full run used for linear LR warmup before "
         "handing control to the plateau-based scheduler.",
     )
-    parser.add_argument("--patience", type=int, default=15, help="Early-stopping patience (epochs).")
+    parser.add_argument("--patience", type=int, default=10, help="Early-stopping patience (epochs).")
 
     parser.add_argument(
         "--lr_patience",
@@ -540,7 +586,7 @@ def get_args():
     parser.add_argument(
         "--class_weight_scheme",
         type=str,
-        default="effective_number",
+        default="none",
         choices=["inverse", "sqrt_inverse", "clipped_inverse", "effective_number", "none"],
         help="How per-class loss weights are computed. 'effective_number' (Cui et al. "
         "2019) is recommended for severely imbalanced classes; 'inverse' reproduces "
@@ -644,6 +690,19 @@ def get_args():
         "80/20 split, and reports mean +/- std per-class metrics across folds. "
         "Recommended for small classes (e.g. ~39 samples) where a single split "
         "gives a high-variance, less defensible estimate.",
+    )
+
+    # --- Test-set clip thinning -------------------------------------------
+    parser.add_argument(
+        "--test_top_clip_only",
+        action="store_true",
+        help="If set, restrict the held-out test set to only the '_1' indexed clip "
+        "per source video, independently per mode present (e.g. keep "
+        "<stem>_max_emotion_1 and <stem>_min_neutral_1 and <stem>_rnd_1, but drop "
+        "_max_emotion_2, _max_emotion_3, ...). Train/val are completely unaffected "
+        "and still use all K clips per video; this does NOT change which source "
+        "videos are assigned to train/val/test -- see filter_test_indices_top_clip_only. "
+        "Default: off (original behavior -- all clips from test videos are used).",
     )
 
     return parser.parse_args()
@@ -1424,7 +1483,7 @@ def main():
         f"Class weight scheme: {args.class_weight_scheme}\nLoss: {args.loss_type}\n"
         f"Weighted sampler: {args.use_weighted_sampler}\nAugmentation: {args.augment}\n"
         f"Freeze epochs: {args.freeze_epochs}\ntorch.compile: {args.use_compile}\n"
-        f"Folds: {args.n_folds}\nDevice: {device}"
+        f"Folds: {args.n_folds}\nTest top-clip-only: {args.test_top_clip_only}\nDevice: {device}"
     )
 
     processor = load_processor(args.model_name)
@@ -1476,6 +1535,60 @@ def main():
         f"Verified: zero source-video overlap between CV pool ({len(set(all_groups[i] for i in cv_indices))} "
         f"unique videos) and test set ({len(set(all_groups[i] for i in test_indices))} unique videos)."
     )
+
+    # --- Optional: thin the test set down to one clip per mode per video ---
+    # This ONLY removes clips from the (already-decided) test set; it never
+    # changes which source videos are in train/val/test, and cannot affect
+    # the leakage guarantees above (filtering a subset of a disjoint split
+    # can't create overlap). See filter_test_indices_top_clip_only.
+    if args.test_top_clip_only:
+        pre_filter_test_indices = test_indices
+        pre_filter_test_videos = set(all_groups[i] for i in pre_filter_test_indices)
+
+        test_indices = filter_test_indices_top_clip_only(test_indices, dataset.video_files)
+
+        # --- Sanity checks --------------------------------------------------
+        # 1) Every surviving test clip really is a "_1" clip.
+        surviving_clip_indices = [
+            extract_source_id_and_clip_index(dataset.video_files[i][0])[1] for i in test_indices
+        ]
+        assert all(ci == 1 for ci in surviving_clip_indices), (
+            "test_top_clip_only: filtering left a non-index-1 clip in the test set -- "
+            "this should be impossible, check filter_test_indices_top_clip_only."
+        )
+
+        # 2) No source video was dropped entirely by the filter (every mode's
+        #    numbering always starts at 1 for a video that produced any
+        #    qualified segments in that mode, per save_qualified_segments, so
+        #    filtering to index==1 should never remove a video's only
+        #    representation in the test set -- verify rather than assume).
+        post_filter_test_videos = set(all_groups[i] for i in test_indices)
+        dropped_videos = pre_filter_test_videos - post_filter_test_videos
+        assert not dropped_videos, (
+            f"test_top_clip_only: {len(dropped_videos)} test source video(s) lost ALL "
+            f"representation after filtering to index-1 clips (e.g. {sorted(dropped_videos)[:5]}...). "
+            f"This means one or more test videos never produced a '_1' clip in any mode, "
+            f"which should not be possible given how save_qualified_segments numbers clips. "
+            f"Investigate before trusting held-out test metrics."
+        )
+        assert post_filter_test_videos.issubset(pre_filter_test_videos), (
+            "test_top_clip_only: filtering somehow introduced a source video that wasn't "
+            "in the test set before filtering -- this should be impossible."
+        )
+
+        # 3) Re-verify group-disjointness against the CV pool on the filtered
+        #    indices (filtering a subset of an already-disjoint split can't
+        #    introduce leakage, but this is cheap and removes any doubt).
+        assert_no_group_leakage(
+            cv_indices, test_indices, all_groups,
+            label_a="CV pool", label_b="held-out test set (top-clip-only)",
+        )
+
+        print(
+            f"--test_top_clip_only: reduced test set from {len(pre_filter_test_indices)} to "
+            f"{len(test_indices)} clips ({len(post_filter_test_videos)} source videos retained, "
+            f"same as before filtering)."
+        )
 
     test_sub = Subset(dataset, test_indices)
     test_ds = AugmentWrapper(test_sub, augment=False)
