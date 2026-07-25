@@ -35,6 +35,14 @@ NUM_RANDOM_SEGMENTS_TO_SAMPLE = NUM_TOP_SEGMENTS_TO_SELECT
 FOURCC_CODEC = cv2.VideoWriter_fourcc(*"mp4v")
 OUTPUT_VIDEO_EXTENSION = ".mp4"
 
+# ---- K-strategy modes ----
+# "fixed"           : current behaviour - a single global K for every class.
+# "manual_balance"  : per-class K supplied by hand as a hyperparameter.
+# "auto_balance"    : per-class K computed automatically from class video
+#                      counts so that total *clips per class* trend toward
+#                      parity (oversampling minority classes).
+K_STRATEGY_CHOICES = ["fixed", "manual_balance", "auto_balance"]
+
 
 # =========================================================================
 # Shared helpers
@@ -251,6 +259,147 @@ def save_qualified_segments(
             filename_suffix_counter -= 1
 
     return saved_count
+
+
+# =========================================================================
+# K-strategy: per-class segment budget resolution
+# =========================================================================
+
+
+def parse_manual_k_string(k_string: str) -> dict:
+    """Parse 'happy=5,sad=20,angry=15' into {'happy': 5, 'sad': 20, 'angry': 15}."""
+    per_class_k = {}
+    if not k_string:
+        return per_class_k
+    for pair in k_string.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ValueError(
+                f"Invalid --manual_k entry '{pair}'. Expected format 'class=K'."
+            )
+        class_name, k_value_str = pair.split("=", 1)
+        class_name = class_name.strip().lower()
+        try:
+            k_value = int(k_value_str.strip())
+        except ValueError:
+            raise ValueError(
+                f"Invalid K value '{k_value_str}' for class '{class_name}' in --manual_k."
+            )
+        if k_value <= 0:
+            raise ValueError(
+                f"K value for class '{class_name}' must be a positive integer, got {k_value}."
+            )
+        per_class_k[class_name] = k_value
+    return per_class_k
+
+
+def count_videos_per_class_imagenet(
+    source_root: pathlib.Path, video_extensions: list[str]
+) -> dict:
+    """Count videos per top-level class folder under an ImageNet-style root.
+
+    Class is taken to be the direct parent folder name of each video file,
+    lower-cased, matching how video_class is derived in the worker
+    functions elsewhere in this script.
+    """
+    suffixes = {ext.lower() for ext in video_extensions}
+    counts: dict = {}
+    for p in source_root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in suffixes:
+            class_name = p.parent.name.lower()
+            counts[class_name] = counts.get(class_name, 0) + 1
+    return counts
+
+
+def compute_auto_balance_k(
+    videos_per_class: dict,
+    base_k: int,
+) -> dict:
+    """Derive a per-class K that pushes total clips-per-class toward parity.
+
+    K_class = round(base_k * max_count / count_class)
+
+    The class with the most videos keeps K == base_k. Classes with fewer
+    videos get a proportionally larger K (oversampling), so that
+    K_class * count_class ~= base_k * max_count for every class, i.e. the
+    expected total number of extracted clips per class is balanced.
+
+    No ceiling is applied here: if a class is severely under-represented,
+    its computed K can end up larger than what any individual video can
+    actually supply (limited by available non-overlapping windows). In
+    that case the worker simply saves as many segments as it can find;
+    the shortfall is a natural consequence of the data, not something
+    this function silently caps.
+    """
+    if not videos_per_class:
+        return {}
+    max_count = max(videos_per_class.values())
+    per_class_k = {}
+    for class_name, count in videos_per_class.items():
+        if count <= 0:
+            continue
+        k_value = round(base_k * max_count / count)
+        per_class_k[class_name] = max(1, k_value)
+    return per_class_k
+
+
+def resolve_per_class_k(
+    k_strategy: str,
+    base_k: int,
+    manual_k_string: str,
+    source_root: pathlib.Path,
+    video_extensions: list[str],
+) -> dict | None:
+    """Return a {class_name: K} dict, or None if k_strategy == 'fixed'
+    (meaning: use base_k for every class, exactly like the original script).
+    """
+    if k_strategy == "fixed":
+        return None
+
+    if k_strategy == "manual_balance":
+        per_class_k = parse_manual_k_string(manual_k_string)
+        if not per_class_k:
+            raise ValueError(
+                "--k_strategy manual_balance requires --manual_k to be set, "
+                "e.g. --manual_k 'happy=5,sad=20,angry=15'."
+            )
+        return per_class_k
+
+    if k_strategy == "auto_balance":
+        videos_per_class = count_videos_per_class_imagenet(source_root, video_extensions)
+        if not videos_per_class:
+            raise ValueError(
+                f"--k_strategy auto_balance could not find any class folders with "
+                f"videos under {source_root}."
+            )
+        per_class_k = compute_auto_balance_k(videos_per_class, base_k)
+        print("Auto-balance K per class (base_k = {}):".format(base_k))
+        for class_name in sorted(per_class_k):
+            print(
+                f"    {class_name}: count={videos_per_class[class_name]}, "
+                f"K={per_class_k[class_name]}"
+            )
+        return per_class_k
+
+    raise ValueError(f"Unknown k_strategy '{k_strategy}'.")
+
+
+def get_k_for_class(
+    per_class_k: dict | None,
+    class_name: str,
+    base_k: int,
+) -> int:
+    """Look up the K to use for a given class.
+
+    Falls back to base_k if per_class_k is None (fixed strategy) or if the
+    class is missing from the per-class map (e.g. not mentioned in
+    --manual_k) so nothing silently breaks for unlisted classes.
+    """
+    if per_class_k is None:
+        return base_k
+    return per_class_k.get(class_name.lower(), base_k)
 
 
 # =========================================================================
@@ -601,7 +750,7 @@ def process_single_video_random_worker(task_args_tuple):
 # =========================================================================
 
 
-def run_max_emotion_pass(args, trim_window_size):
+def run_max_emotion_pass(args, trim_window_size, per_class_k: dict | None):
     source_videos_root = pathlib.Path(args.source_dir)
     pre_analyzed_root = pathlib.Path(args.logs)
     trimmed_output_root = pathlib.Path(args.output_dir) / "max_emotion"
@@ -614,7 +763,7 @@ def run_max_emotion_pass(args, trim_window_size):
         return
 
     trimmed_output_root.mkdir(parents=True, exist_ok=True)
-    print(f"\n=== Max-emotion pass ===")
+    print(f"\n=== Max-emotion pass (k_strategy={args.k_strategy}) ===")
     print(f"Max-emotion trimmed videos will be saved in: {trimmed_output_root}")
 
     analysis_folders_found = find_analysis_folders_imagenet(pre_analyzed_root)
@@ -634,7 +783,9 @@ def run_max_emotion_pass(args, trim_window_size):
             VIDEO_EXTENSIONS,
             EMOTIONS,
             trim_window_size,
-            NUM_TOP_SEGMENTS_TO_SELECT,
+            get_k_for_class(
+                per_class_k, folder_path.parent.name, NUM_TOP_SEGMENTS_TO_SELECT
+            ),
             MINIMUM_SCORE_FOR_TOP_N_THRESHOLD,
             FOURCC_CODEC,
             OUTPUT_VIDEO_EXTENSION,
@@ -671,7 +822,7 @@ def run_max_emotion_pass(args, trim_window_size):
     print(f"Trimmed videos are in: {trimmed_output_root}")
 
 
-def run_min_neutral_pass(args, trim_window_size):
+def run_min_neutral_pass(args, trim_window_size, per_class_k: dict | None):
     source_videos_root = pathlib.Path(args.source_dir)
     pre_analyzed_root = pathlib.Path(args.logs)
     trimmed_output_root = pathlib.Path(args.output_dir) / "min_neutral"
@@ -684,7 +835,7 @@ def run_min_neutral_pass(args, trim_window_size):
         return
 
     trimmed_output_root.mkdir(parents=True, exist_ok=True)
-    print(f"\n=== Min-neutral pass ===")
+    print(f"\n=== Min-neutral pass (k_strategy={args.k_strategy}) ===")
     print(f"Min-neutral trimmed videos will be saved in: {trimmed_output_root}")
 
     analysis_folders_found = find_analysis_folders_imagenet(pre_analyzed_root)
@@ -703,7 +854,9 @@ def run_min_neutral_pass(args, trim_window_size):
             VIDEO_EXTENSIONS,
             NEUTRAL_EMOTION_COLUMN,
             trim_window_size,
-            NUM_TOP_SEGMENTS_TO_SELECT,
+            get_k_for_class(
+                per_class_k, folder_path.parent.name, NUM_TOP_SEGMENTS_TO_SELECT
+            ),
             MAXIMUM_SCORE_FOR_MIN_NEUTRAL_THRESHOLD,
             FOURCC_CODEC,
             OUTPUT_VIDEO_EXTENSION,
@@ -740,7 +893,7 @@ def run_min_neutral_pass(args, trim_window_size):
     print(f"Trimmed videos are in: {trimmed_output_root}")
 
 
-def run_random_pass(args, trim_window_size):
+def run_random_pass(args, trim_window_size, per_class_k: dict | None):
     source_root = pathlib.Path(args.source_dir)
     trimmed_output_root = pathlib.Path(args.output_dir) / "random"
     trimmed_output_root.mkdir(parents=True, exist_ok=True)
@@ -749,7 +902,7 @@ def run_random_pass(args, trim_window_size):
         print(f"Error: Source not found: {source_root}")
         return
 
-    print(f"\n=== Random pass ===")
+    print(f"\n=== Random pass (k_strategy={args.k_strategy}) ===")
     video_files = collect_videos_imagenet(source_root, VIDEO_EXTENSIONS)
 
     if not video_files:
@@ -758,9 +911,6 @@ def run_random_pass(args, trim_window_size):
 
     print(f"Found {len(video_files)} videos under: {source_root}")
     print(f"Outputting to: {trimmed_output_root}")
-    print(
-        f"Configuration: {NUM_RANDOM_SEGMENTS_TO_SAMPLE} random segments of size {trim_window_size} per video."
-    )
 
     tasks = [
         (
@@ -768,7 +918,9 @@ def run_random_pass(args, trim_window_size):
             str(source_root),
             str(trimmed_output_root),
             trim_window_size,
-            NUM_RANDOM_SEGMENTS_TO_SAMPLE,
+            get_k_for_class(
+                per_class_k, video_path.parent.name, NUM_RANDOM_SEGMENTS_TO_SAMPLE
+            ),
             FOURCC_CODEC,
             OUTPUT_VIDEO_EXTENSION,
         )
@@ -806,7 +958,8 @@ def run_random_pass(args, trim_window_size):
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Temporal distillation: max-emotion, min-neutral, and/or random trimming."
+        description="Temporal distillation: max-emotion, min-neutral, and/or random trimming, "
+        "with optional per-class K balancing for imbalanced DFER datasets."
     )
     parser.add_argument(
         "--mode",
@@ -843,6 +996,28 @@ def get_args() -> argparse.Namespace:
         required=True,
         help="Number of frames per distilled clip (e.g. 16 for ViViT, 8 for TimeSformer).",
     )
+    parser.add_argument(
+        "--k_strategy",
+        type=str,
+        choices=K_STRATEGY_CHOICES,
+        default="auto_balance",
+        help="How many segments (K) to select per class. "
+        "'fixed' (default): one global K for every class, identical to the "
+        "original behaviour (NUM_TOP_SEGMENTS_TO_SELECT / NUM_RANDOM_SEGMENTS_TO_SAMPLE). "
+        "'manual_balance': supply K per class by hand via --manual_k. "
+        "'auto_balance': K is computed automatically from class video counts so "
+        "that total extracted clips per class trend toward parity (minority "
+        "classes are oversampled).",
+    )
+    parser.add_argument(
+        "--manual_k",
+        type=str,
+        default=None,
+        help="Only used when --k_strategy manual_balance. Comma-separated "
+        "'class=K' pairs, e.g. \"happy=5,sad=20,angry=15,disgust=40\". "
+        "Classes not listed fall back to the default base K "
+        "(NUM_TOP_SEGMENTS_TO_SELECT / NUM_RANDOM_SEGMENTS_TO_SAMPLE).",
+    )
     return parser.parse_args()
 
 
@@ -858,16 +1033,26 @@ if __name__ == "__main__":
     output_root = pathlib.Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
+    # Resolve the per-class K map once, up front, so every pass uses the
+    # same balancing decision.
+    per_class_k_map = resolve_per_class_k(
+        k_strategy=args.k_strategy,
+        base_k=NUM_TOP_SEGMENTS_TO_SELECT,
+        manual_k_string=args.manual_k,
+        source_root=pathlib.Path(args.source_dir),
+        video_extensions=VIDEO_EXTENSIONS,
+    )
+
     overall_start = time.time()
 
     if args.mode in ("max_emotion", "both"):
-        run_max_emotion_pass(args, TRIM_WINDOW_SIZE)
+        run_max_emotion_pass(args, TRIM_WINDOW_SIZE, per_class_k_map)
 
     if args.mode in ("min_neutral", "both"):
-        run_min_neutral_pass(args, TRIM_WINDOW_SIZE)
+        run_min_neutral_pass(args, TRIM_WINDOW_SIZE, per_class_k_map)
 
     if args.mode in ("random", "both"):
-        run_random_pass(args, TRIM_WINDOW_SIZE)
+        run_random_pass(args, TRIM_WINDOW_SIZE, per_class_k_map)
 
     print("\n" + "=" * 50)
     print(
