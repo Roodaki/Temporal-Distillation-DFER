@@ -6,6 +6,7 @@ import pathlib
 import time
 import numpy as np
 import multiprocessing as mp
+from collections import defaultdict
 
 # =========================================================================
 # Shared configuration
@@ -25,10 +26,34 @@ VIDEO_EXTENSIONS = [".mp4", ".avi", ".mov"]
 EMOTIONS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
 
 NUM_TOP_SEGMENTS_TO_SELECT = 10
-MINIMUM_SCORE_FOR_TOP_N_THRESHOLD = 1.0
 
+# ---- Score gating (max-emotion pass) ----
+# Scores in emotion_data.csv are on a 0-100 scale. Emotions like "happy" or
+# "neutral" are usually detected with high, sustained confidence, while
+# emotions like "disgust" or "surprise" are frequently detected with much
+# lower confidence even in a genuine expression, because probability mass
+# is spread across all classes. A single fixed absolute floor therefore
+# ends up being trivial for strong emotions and nearly unreachable for
+# weak ones - exactly the classes that most need their K quota to survive.
+#
+# Instead, qualification is RELATIVE to the best window found in that
+# specific video: a window must reach at least
+# RELATIVE_SCORE_FLOOR_FRACTION * (that video's own best window score).
+# ABSOLUTE_NOISE_FLOOR is a small absolute backstop so that a window is
+# never accepted if it's genuinely ~0 signal (e.g. best window itself is
+# essentially noise).
+RELATIVE_SCORE_FLOOR_FRACTION = 0.05
+ABSOLUTE_NOISE_FLOOR = 0.01
+
+# ---- Score gating (min-neutral pass) ----
+# Mirrors the logic above but as a ceiling: a window qualifies only if its
+# neutral-score is close to that video's own *lowest* (best/least-neutral)
+# window, rather than needing to clear a single fixed global ceiling that
+# may be trivial or impossible depending on how "neutral-heavy" a given
+# video happens to be.
 NEUTRAL_EMOTION_COLUMN = "neutral"
-MAXIMUM_SCORE_FOR_MIN_NEUTRAL_THRESHOLD = 90
+RELATIVE_NEUTRAL_CEILING_SLACK_FRACTION = 0.05
+ABSOLUTE_NEUTRAL_CEILING_BACKSTOP = 99.99
 
 NUM_RANDOM_SEGMENTS_TO_SAMPLE = NUM_TOP_SEGMENTS_TO_SELECT
 
@@ -36,12 +61,59 @@ FOURCC_CODEC = cv2.VideoWriter_fourcc(*"mp4v")
 OUTPUT_VIDEO_EXTENSION = ".mp4"
 
 # ---- K-strategy modes ----
-# "fixed"           : current behaviour - a single global K for every class.
+# K-strategy ONLY applies to the random pass now (see history below). It has
+# no effect on max_emotion / min_neutral.
+# "fixed"           : a single global K for every class (candidate-pool size
+#                      per video before class-wide balancing kicks in).
 # "manual_balance"  : per-class K supplied by hand as a hyperparameter.
 # "auto_balance"    : per-class K computed automatically from class video
-#                      counts so that total *clips per class* trend toward
-#                      parity (oversampling minority classes).
+#                      counts so that total *candidate clips per class*
+#                      trend toward parity (oversampling minority classes)
+#                      before the final class-wide balancing step.
 K_STRATEGY_CHOICES = ["fixed", "manual_balance", "auto_balance"]
+
+# ---- Uncapped K for max_emotion / min_neutral (all classes) ----
+# max_emotion and min_neutral no longer use K/--k_strategy at all. Every
+# class's Phase 1 pulls every threshold-qualifying, non-overlapping window it
+# can produce, full stop. Rationale: apply_global_topk_balance()'s
+# target_count is min() across all classes' candidate pools - so whichever
+# class is smallest effectively sets the ceiling every other class gets
+# trimmed down to. Any K cap - even one that's *not* the tightest class - can
+# only ever push a class's pool down, never up, so a too-conservative K
+# (a bad auto_balance estimate, or an under-set --manual_k) can quietly
+# produce a false minimum that global_topk has no way to detect or correct
+# (it only trims classes ABOVE target_count, never pads classes below it).
+# Removing K entirely for every class removes that failure mode: each
+# class's pool becomes its true ceiling (threshold + non-overlap, nothing
+# else), target_count becomes the true achievable minimum across classes,
+# and every class is synced to exactly that. UNCAPPED_K is a sentinel
+# consumed by select_non_overlapping_segments(), where it simply never
+# triggers the early-stop, so every qualifying window is kept.
+UNCAPPED_K = float("inf")
+
+# ---- Class-wide balancing (final step for max_emotion / min_neutral) ----
+# K-strategy controls how large a CANDIDATE pool each video is allowed to
+# contribute (oversampling minority classes at the per-video level). But if
+# a class has enough videos, even a small per-video K can still add up to
+# far more candidates than a minority class can ever produce in total - K
+# only pushes candidate counts UP, nothing pulls an oversized class DOWN.
+#
+# BALANCE_MODE controls what happens after all candidates are scored:
+#   "none"        : keep every qualified candidate, exactly as K produced it
+#                    (old behaviour - classes stay imbalanced if their
+#                    videos collectively out-produce minority classes).
+#   "global_topk" : compute target_count = size of the SMALLEST class's
+#                    candidate pool (after K-oversampling has done its
+#                    best). Any class with MORE candidates than target_count
+#                    is trimmed down to its class-wide best `target_count`
+#                    candidates by score (highest mean target-emotion score
+#                    for max_emotion, lowest mean neutral score for
+#                    min_neutral) - pooling across ALL videos in that class,
+#                    not per-video. Classes with fewer candidates than
+#                    target_count keep everything they have (can't
+#                    manufacture data that doesn't exist).
+BALANCE_MODE_CHOICES = ["none", "global_topk"]
+DEFAULT_BALANCE_MODE = "global_topk"
 
 
 # =========================================================================
@@ -262,7 +334,7 @@ def save_qualified_segments(
 
 
 # =========================================================================
-# K-strategy: per-class segment budget resolution
+# K-strategy: per-class candidate-pool budget resolution
 # =========================================================================
 
 
@@ -317,19 +389,21 @@ def compute_auto_balance_k(
     videos_per_class: dict,
     base_k: int,
 ) -> dict:
-    """Derive a per-class K that pushes total clips-per-class toward parity.
+    """Derive a per-class candidate-pool K that pushes total candidates-per-class
+    toward parity.
 
     K_class = round(base_k * max_count / count_class)
 
     The class with the most videos keeps K == base_k. Classes with fewer
     videos get a proportionally larger K (oversampling), so that
     K_class * count_class ~= base_k * max_count for every class, i.e. the
-    expected total number of extracted clips per class is balanced.
+    expected total number of CANDIDATE clips per class is balanced before
+    the final class-wide top-K trim.
 
     No ceiling is applied here: if a class is severely under-represented,
     its computed K can end up larger than what any individual video can
     actually supply (limited by available non-overlapping windows). In
-    that case the worker simply saves as many segments as it can find;
+    that case the worker simply returns as many candidates as it can find;
     the shortfall is a natural consequence of the data, not something
     this function silently caps.
     """
@@ -402,240 +476,469 @@ def get_k_for_class(
     return per_class_k.get(class_name.lower(), base_k)
 
 
+def format_k_for_display(k) -> str:
+    """Render a K value for log/status messages, special-casing UNCAPPED_K
+    so logs read 'top all-available' instead of 'top inf'."""
+    return "all-available" if k == UNCAPPED_K else str(k)
+
+
 # =========================================================================
-# Max-emotion worker (formerly "emotion" mode)
+# Class-wide balancing (final step: trims oversized classes down to the
+# smallest class's candidate-pool size, keeping only the globally best
+# candidates within each oversized class)
 # =========================================================================
 
 
-def process_single_video_max_emotion_worker(task_args_tuple):
+def apply_global_topk_balance(
+    candidates_by_class: dict,
+    balance_mode: str,
+    higher_is_better: bool,
+) -> dict:
+    """Given {class_name: [candidate_dict, ...]}, return a new dict trimmed
+    according to balance_mode.
+
+    "none"        : returned unchanged.
+    "global_topk" : target_count = size of the smallest class's candidate
+                    list. Any class with more than target_count candidates
+                    is trimmed to its target_count BEST candidates (pooled
+                    across all videos in that class, sorted by
+                    candidate["mean_score"], highest-first if
+                    higher_is_better else lowest-first). Classes with
+                    target_count or fewer candidates are left untouched.
+
+    Empty candidate lists (a class that produced literally zero qualified
+    candidates) are ignored when computing target_count, since an empty
+    class can't set a meaningful floor for everyone else; such a class
+    simply contributes 0 either way.
+    """
+    if balance_mode == "none":
+        return candidates_by_class
+
+    if balance_mode != "global_topk":
+        raise ValueError(f"Unknown balance_mode '{balance_mode}'.")
+
+    non_empty_counts = [
+        len(candidates) for candidates in candidates_by_class.values() if candidates
+    ]
+    if not non_empty_counts:
+        return candidates_by_class
+
+    target_count = min(non_empty_counts)
+
+    print(f"\nClass-wide balancing target (smallest class pool): {target_count} candidates")
+
+    balanced = {}
+    for class_name, candidates in candidates_by_class.items():
+        if len(candidates) <= target_count:
+            balanced[class_name] = candidates
+            print(
+                f"    {class_name}: {len(candidates)} candidates <= target, keeping all."
+            )
+            continue
+
+        sorted_candidates = sorted(
+            candidates, key=lambda c: c["mean_score"], reverse=higher_is_better
+        )
+        balanced[class_name] = sorted_candidates[:target_count]
+        print(
+            f"    {class_name}: {len(candidates)} candidates > target, "
+            f"trimmed to top {target_count} by score."
+        )
+
+    return balanced
+
+
+def group_candidates_by_video(candidates: list[dict]) -> dict:
+    """Group a flat list of candidates (each carrying its own video identity
+    fields) back into {video_key: [candidate, ...]} so Phase 2 can write all
+    surviving segments for a given video in one file-open."""
+    grouped = defaultdict(list)
+    for candidate in candidates:
+        grouped[candidate["video_key"]].append(candidate)
+    return grouped
+
+
+# =========================================================================
+# Max-emotion: Phase 1 (score only, no writing)
+# =========================================================================
+
+
+def score_single_video_max_emotion_worker(task_args_tuple):
     (
         analysis_folder_path_str,
         pre_analyzed_root_str,
         source_videos_root_str,
-        trimmed_output_root_str,
         class_to_emotion_map,
         video_extensions,
         emotions,
         trim_window_size,
         num_top_segments,
-        min_score_threshold,
-        fourcc_codec,
-        output_video_extension,
+        relative_score_floor_fraction,
+        absolute_noise_floor,
     ) = task_args_tuple
 
     analysis_folder_path = pathlib.Path(analysis_folder_path_str)
     pre_analyzed_root = pathlib.Path(pre_analyzed_root_str)
     source_videos_root = pathlib.Path(source_videos_root_str)
-    trimmed_output_root = pathlib.Path(trimmed_output_root_str)
 
     video_stem = analysis_folder_path.name.replace("_analyze", "")
-    pid = os.getpid()
-    start_time_video_processing = time.time()
 
     try:
         relative_class_dir = analysis_folder_path.parent.relative_to(pre_analyzed_root)
     except ValueError:
-        return f"{video_stem}: Error - Analysis folder is not under the analysis root."
-
-    log_prefix = f"{pid}-{relative_class_dir}/{video_stem}"
+        return {
+            "status": f"{video_stem}: Error - Analysis folder is not under the analysis root.",
+            "class_name": None,
+            "candidates": [],
+        }
 
     # In ImageNet-style datasets, the class comes from the folder name, not from the filename.
     video_class = analysis_folder_path.parent.name.lower()
     if video_class not in class_to_emotion_map:
-        return f"{relative_class_dir}/{video_stem}: Error - Class folder '{video_class}' not in CLASS_TO_EMOTION_MAP."
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - Class folder '{video_class}' not in CLASS_TO_EMOTION_MAP.",
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     target_emotion = class_to_emotion_map[video_class]
     if target_emotion not in emotions:
-        return f"{relative_class_dir}/{video_stem}: Error - Mapped emotion '{target_emotion}' is not valid."
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - Mapped emotion '{target_emotion}' is not valid.",
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     csv_file_path = analysis_folder_path / "emotion_data.csv"
     if not csv_file_path.exists():
-        return f"{relative_class_dir}/{video_stem}: Error - CSV not found."
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - CSV not found.",
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     try:
         df = pd.read_csv(csv_file_path)
         if df.empty or "frame" not in df.columns:
-            return f"{relative_class_dir}/{video_stem}: Error - CSV empty or missing 'frame' column."
+            return {
+                "status": f"{relative_class_dir}/{video_stem}: Error - CSV empty or missing 'frame' column.",
+                "class_name": video_class,
+                "candidates": [],
+            }
         if target_emotion not in df.columns:
-            return f"{relative_class_dir}/{video_stem}: Error - Target emotion column '{target_emotion}' not found in CSV."
+            return {
+                "status": f"{relative_class_dir}/{video_stem}: Error - Target emotion column '{target_emotion}' not found in CSV.",
+                "class_name": video_class,
+                "candidates": [],
+            }
     except Exception as e:
-        return f"{relative_class_dir}/{video_stem}: Error - CSV read failed: {e}"
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - CSV read failed: {e}",
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     original_video_file = find_source_video(
         source_videos_root, relative_class_dir, video_stem, video_extensions
     )
     if original_video_file is None:
-        return f"{relative_class_dir}/{video_stem}: Error - Original video not found under source class folder."
-
-    class_output_dir = trimmed_output_root / relative_class_dir
-    class_output_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - Original video not found under source class folder.",
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     props = read_video_properties(original_video_file)
     if props is None:
-        return f"{relative_class_dir}/{video_stem}: Error - Could not open/read original video properties."
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - Could not open/read original video properties.",
+            "class_name": video_class,
+            "candidates": [],
+        }
     fps, frame_width, frame_height, total_frames_original_video = props
 
     can_trim_based_on_data = len(df) >= trim_window_size
     can_trim_based_on_video = total_frames_original_video >= trim_window_size
     if not (can_trim_based_on_data and can_trim_based_on_video):
-        return (
-            f"{relative_class_dir}/{video_stem}: Skipping - Not enough frames in CSV "
-            f"({len(df)}) or video ({total_frames_original_video}) for window {trim_window_size}."
-        )
+        return {
+            "status": (
+                f"{relative_class_dir}/{video_stem}: Skipping - Not enough frames in CSV "
+                f"({len(df)}) or video ({total_frames_original_video}) for window {trim_window_size}."
+            ),
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     all_evaluated_segments = evaluate_sliding_windows(
         df, target_emotion, trim_window_size, total_frames_original_video
     )
 
     if not all_evaluated_segments:
-        return (
-            f"{relative_class_dir}/{video_stem}: No valid segments could be evaluated."
-        )
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: No valid segments could be evaluated.",
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     # Highest mean target-emotion score first.
     all_evaluated_segments.sort(key=lambda x: x["mean_score"], reverse=True)
     non_overlapping_candidates = select_non_overlapping_segments(
         all_evaluated_segments, num_top_segments
     )
+
+    if not non_overlapping_candidates:
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: No non-overlapping candidate segments found.",
+            "class_name": video_class,
+            "candidates": [],
+        }
+
+    # Qualification is relative to THIS VIDEO's own best window, rather than
+    # a fixed global floor (see module docstring constants above).
+    best_score_this_video = non_overlapping_candidates[0]["mean_score"]
+    relative_floor = max(
+        relative_score_floor_fraction * best_score_this_video, absolute_noise_floor
+    )
+
     qualified_segments = [
         segment
         for segment in non_overlapping_candidates
-        if segment["mean_score"] >= min_score_threshold
+        if segment["mean_score"] >= relative_floor
     ]
 
-    if not qualified_segments:
-        return (
-            f"{relative_class_dir}/{video_stem}: No segments from top {num_top_segments} "
-            f"met score threshold {min_score_threshold}."
+    video_key = f"{relative_class_dir}/{video_stem}"
+    for segment in qualified_segments:
+        segment["video_key"] = video_key
+        segment["class_name"] = video_class
+        segment["video_stem"] = video_stem
+        segment["relative_class_dir"] = str(relative_class_dir)
+        segment["original_video_file"] = str(original_video_file)
+        segment["fps"] = fps
+        segment["frame_width"] = frame_width
+        segment["frame_height"] = frame_height
+
+    status = (
+        f"{video_key}: Scored. {len(qualified_segments)} candidates qualified "
+        f"(relative floor {relative_floor:.4f}, best window {best_score_this_video:.4f})."
+        if qualified_segments
+        else (
+            f"{video_key}: No segments from top {format_k_for_display(num_top_segments)} met relative "
+            f"score floor {relative_floor:.4f} (best window: {best_score_this_video:.4f})."
         )
-
-    saved_segments_for_this_video = save_qualified_segments(
-        qualified_segments,
-        original_video_file,
-        class_output_dir,
-        video_stem,
-        "max_emotion",
-        trim_window_size,
-        fps,
-        frame_width,
-        frame_height,
-        fourcc_codec,
-        output_video_extension,
-        log_prefix,
     )
 
-    processing_time = time.time() - start_time_video_processing
-    summary = (
-        f"{relative_class_dir}/{video_stem}: Processed in {processing_time:.2f}s. "
-        f"Saved {saved_segments_for_this_video} segments."
-    )
-    print(f"[{log_prefix}] Finished. {summary}")
-    return summary
+    return {
+        "status": status,
+        "class_name": video_class,
+        "candidates": qualified_segments,
+    }
 
 
 # =========================================================================
-# Min-neutral worker
+# Min-neutral: Phase 1 (score only, no writing)
 # =========================================================================
 
 
-def process_single_video_min_neutral_worker(task_args_tuple):
+def score_single_video_min_neutral_worker(task_args_tuple):
     (
         analysis_folder_path_str,
         pre_analyzed_root_str,
         source_videos_root_str,
-        trimmed_output_root_str,
         video_extensions,
         neutral_column,
         trim_window_size,
         num_top_segments,
-        max_score_threshold,
-        fourcc_codec,
-        output_video_extension,
+        relative_neutral_ceiling_slack_fraction,
+        absolute_neutral_ceiling_backstop,
     ) = task_args_tuple
 
     analysis_folder_path = pathlib.Path(analysis_folder_path_str)
     pre_analyzed_root = pathlib.Path(pre_analyzed_root_str)
     source_videos_root = pathlib.Path(source_videos_root_str)
-    trimmed_output_root = pathlib.Path(trimmed_output_root_str)
 
     video_stem = analysis_folder_path.name.replace("_analyze", "")
-    pid = os.getpid()
-    start_time_video_processing = time.time()
 
     try:
         relative_class_dir = analysis_folder_path.parent.relative_to(pre_analyzed_root)
     except ValueError:
-        return f"{video_stem}: Error - Analysis folder is not under the analysis root."
+        return {
+            "status": f"{video_stem}: Error - Analysis folder is not under the analysis root.",
+            "class_name": None,
+            "candidates": [],
+        }
 
-    log_prefix = f"{pid}-{relative_class_dir}/{video_stem}"
+    video_class = analysis_folder_path.parent.name.lower()
 
     csv_file_path = analysis_folder_path / "emotion_data.csv"
     if not csv_file_path.exists():
-        return f"{relative_class_dir}/{video_stem}: Error - CSV not found."
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - CSV not found.",
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     try:
         df = pd.read_csv(csv_file_path)
         if df.empty or "frame" not in df.columns:
-            return f"{relative_class_dir}/{video_stem}: Error - CSV empty or missing 'frame' column."
+            return {
+                "status": f"{relative_class_dir}/{video_stem}: Error - CSV empty or missing 'frame' column.",
+                "class_name": video_class,
+                "candidates": [],
+            }
         if neutral_column not in df.columns:
-            return f"{relative_class_dir}/{video_stem}: Error - '{neutral_column}' column not found in CSV."
+            return {
+                "status": f"{relative_class_dir}/{video_stem}: Error - '{neutral_column}' column not found in CSV.",
+                "class_name": video_class,
+                "candidates": [],
+            }
     except Exception as e:
-        return f"{relative_class_dir}/{video_stem}: Error - CSV read failed: {e}"
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - CSV read failed: {e}",
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     original_video_file = find_source_video(
         source_videos_root, relative_class_dir, video_stem, video_extensions
     )
     if original_video_file is None:
-        return f"{relative_class_dir}/{video_stem}: Error - Original video not found under source class folder."
-
-    class_output_dir = trimmed_output_root / relative_class_dir
-    class_output_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - Original video not found under source class folder.",
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     props = read_video_properties(original_video_file)
     if props is None:
-        return f"{relative_class_dir}/{video_stem}: Error - Could not open/read original video properties."
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - Could not open/read original video properties.",
+            "class_name": video_class,
+            "candidates": [],
+        }
     fps, frame_width, frame_height, total_frames_original_video = props
 
     can_trim_based_on_data = len(df) >= trim_window_size
     can_trim_based_on_video = total_frames_original_video >= trim_window_size
     if not (can_trim_based_on_data and can_trim_based_on_video):
-        return (
-            f"{relative_class_dir}/{video_stem}: Skipping - Not enough frames in CSV "
-            f"({len(df)}) or video ({total_frames_original_video}) for window {trim_window_size}."
-        )
+        return {
+            "status": (
+                f"{relative_class_dir}/{video_stem}: Skipping - Not enough frames in CSV "
+                f"({len(df)}) or video ({total_frames_original_video}) for window {trim_window_size}."
+            ),
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     all_evaluated_segments = evaluate_sliding_windows(
         df, neutral_column, trim_window_size, total_frames_original_video
     )
 
     if not all_evaluated_segments:
-        return (
-            f"{relative_class_dir}/{video_stem}: No valid segments could be evaluated."
-        )
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: No valid segments could be evaluated.",
+            "class_name": video_class,
+            "candidates": [],
+        }
 
     # Lowest mean neutral score first (least neutral / most expressive).
     all_evaluated_segments.sort(key=lambda x: x["mean_score"])
     non_overlapping_candidates = select_non_overlapping_segments(
         all_evaluated_segments, num_top_segments
     )
+
+    if not non_overlapping_candidates:
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: No non-overlapping candidate segments found.",
+            "class_name": video_class,
+            "candidates": [],
+        }
+
+    best_score_this_video = non_overlapping_candidates[0]["mean_score"]
+    relative_ceiling = min(
+        best_score_this_video + relative_neutral_ceiling_slack_fraction * best_score_this_video,
+        absolute_neutral_ceiling_backstop,
+    )
+
     qualified_segments = [
         segment
         for segment in non_overlapping_candidates
-        if segment["mean_score"] <= max_score_threshold
+        if segment["mean_score"] <= relative_ceiling
     ]
 
-    if not qualified_segments:
-        return (
-            f"{relative_class_dir}/{video_stem}: No segments from bottom {num_top_segments} "
-            f"met neutral-score ceiling {max_score_threshold}."
-        )
+    video_key = f"{relative_class_dir}/{video_stem}"
+    for segment in qualified_segments:
+        segment["video_key"] = video_key
+        segment["class_name"] = video_class
+        segment["video_stem"] = video_stem
+        segment["relative_class_dir"] = str(relative_class_dir)
+        segment["original_video_file"] = str(original_video_file)
+        segment["fps"] = fps
+        segment["frame_width"] = frame_width
+        segment["frame_height"] = frame_height
 
-    saved_segments_for_this_video = save_qualified_segments(
-        qualified_segments,
+    status = (
+        f"{video_key}: Scored. {len(qualified_segments)} candidates qualified "
+        f"(relative ceiling {relative_ceiling:.4f}, best window {best_score_this_video:.4f})."
+        if qualified_segments
+        else (
+            f"{video_key}: No segments from bottom {format_k_for_display(num_top_segments)} met relative "
+            f"neutral-score ceiling {relative_ceiling:.4f} (best window: {best_score_this_video:.4f})."
+        )
+    )
+
+    return {
+        "status": status,
+        "class_name": video_class,
+        "candidates": qualified_segments,
+    }
+
+
+# =========================================================================
+# Phase 2 (shared): write the final, balanced candidate set for one video
+# =========================================================================
+
+
+def write_candidates_for_video_worker(task_args_tuple):
+    (
+        video_key,
+        candidates_for_video,
+        trimmed_output_root_str,
+        filename_suffix,
+        trim_window_size,
+        fourcc_codec,
+        output_video_extension,
+    ) = task_args_tuple
+
+    trimmed_output_root = pathlib.Path(trimmed_output_root_str)
+    pid = os.getpid()
+
+    if not candidates_for_video:
+        return f"{video_key}: Saved 0 segments (no surviving candidates)."
+
+    first = candidates_for_video[0]
+    original_video_file = pathlib.Path(first["original_video_file"])
+    relative_class_dir = pathlib.Path(first["relative_class_dir"])
+    video_stem = first["video_stem"]
+    fps = first["fps"]
+    frame_width = first["frame_width"]
+    frame_height = first["frame_height"]
+
+    log_prefix = f"{pid}-{video_key}"
+
+    class_output_dir = trimmed_output_root / relative_class_dir
+    class_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Keep chronological order in the output filenames for readability.
+    ordered_candidates = sorted(
+        candidates_for_video, key=lambda c: c["video_start_frame"]
+    )
+
+    saved_count = save_qualified_segments(
+        ordered_candidates,
         original_video_file,
         class_output_dir,
         video_stem,
-        "min_neutral",
+        filename_suffix,
         trim_window_size,
         fps,
         frame_width,
@@ -645,17 +948,14 @@ def process_single_video_min_neutral_worker(task_args_tuple):
         log_prefix,
     )
 
-    processing_time = time.time() - start_time_video_processing
-    summary = (
-        f"{relative_class_dir}/{video_stem}: Processed in {processing_time:.2f}s. "
-        f"Saved {saved_segments_for_this_video} segments."
-    )
+    summary = f"{video_key}: Saved {saved_count} segments."
     print(f"[{log_prefix}] Finished. {summary}")
     return summary
 
 
 # =========================================================================
-# Random-trimming worker
+# Random-trimming worker (unchanged - single phase, no cross-class scoring
+# to balance since selection is already random rather than score-based)
 # =========================================================================
 
 
@@ -750,7 +1050,102 @@ def process_single_video_random_worker(task_args_tuple):
 # =========================================================================
 
 
-def run_max_emotion_pass(args, trim_window_size, per_class_k: dict | None):
+def run_two_phase_pass(
+    pass_label: str,
+    score_worker_fn,
+    tasks_args_list: list[tuple],
+    trimmed_output_root: pathlib.Path,
+    filename_suffix: str,
+    trim_window_size: int,
+    balance_mode: str,
+    higher_is_better: bool,
+    num_processes_to_use: int,
+):
+    """Shared two-phase driver used by both max_emotion and min_neutral passes.
+
+    Phase 1: score every video in parallel (no writing).
+    Between phases: group candidates by class, apply class-wide balancing.
+    Phase 2: write the surviving candidates, grouped back by video, in parallel.
+    """
+    print(f"\n=== {pass_label} pass (balance_mode={balance_mode}) ===")
+
+    if not tasks_args_list:
+        print("No tasks to process.")
+        return
+
+    print(f"Found {len(tasks_args_list)} pre-analyzed folders to process.")
+    print(f"Phase 1: scoring candidates with {num_processes_to_use} processes...")
+
+    phase1_start = time.time()
+    with mp.Pool(processes=num_processes_to_use) as pool:
+        phase1_results = pool.map(score_worker_fn, tasks_args_list)
+    print(f"Phase 1 finished in {time.time() - phase1_start:.2f}s.")
+
+    error_or_skip_count = 0
+    candidates_by_class = defaultdict(list)
+    for result in phase1_results:
+        print(f"  {result['status']}")
+        if "Error" in result["status"] or "Skipping" in result["status"]:
+            error_or_skip_count += 1
+        if result["class_name"] is not None:
+            candidates_by_class[result["class_name"]].extend(result["candidates"])
+
+    print("\nPhase 1 candidate pool per class (before class-wide balancing):")
+    for class_name in sorted(candidates_by_class):
+        print(f"    {class_name}: {len(candidates_by_class[class_name])} candidates")
+
+    balanced_candidates_by_class = apply_global_topk_balance(
+        dict(candidates_by_class), balance_mode, higher_is_better
+    )
+
+    # Flatten back out and regroup by video for Phase 2 writing.
+    all_surviving_candidates = [
+        candidate
+        for candidates in balanced_candidates_by_class.values()
+        for candidate in candidates
+    ]
+
+    if not all_surviving_candidates:
+        print("\nNo candidates survived balancing - nothing to write.")
+        return
+
+    candidates_by_video = group_candidates_by_video(all_surviving_candidates)
+
+    phase2_tasks = [
+        (
+            video_key,
+            video_candidates,
+            str(trimmed_output_root),
+            filename_suffix,
+            trim_window_size,
+            FOURCC_CODEC,
+            OUTPUT_VIDEO_EXTENSION,
+        )
+        for video_key, video_candidates in candidates_by_video.items()
+    ]
+
+    print(
+        f"\nPhase 2: writing {len(all_surviving_candidates)} surviving segments "
+        f"across {len(phase2_tasks)} videos with {num_processes_to_use} processes..."
+    )
+
+    phase2_start = time.time()
+    with mp.Pool(processes=num_processes_to_use) as pool:
+        phase2_results = pool.map(write_candidates_for_video_worker, phase2_tasks)
+    print(f"Phase 2 finished in {time.time() - phase2_start:.2f}s.")
+
+    total_segments_saved = 0
+    for result_summary in phase2_results:
+        total_segments_saved += parse_saved_segment_count(result_summary)
+
+    print("\n" + "=" * 50)
+    print(f"{pass_label} Pass Summary:")
+    print(f"Analysis folders scored: {len(tasks_args_list)} (errors/skips: {error_or_skip_count})")
+    print(f"Total segments successfully written: {total_segments_saved}")
+    print(f"Trimmed videos are in: {trimmed_output_root}")
+
+
+def run_max_emotion_pass(args, trim_window_size):
     source_videos_root = pathlib.Path(args.source_dir)
     pre_analyzed_root = pathlib.Path(args.logs)
     trimmed_output_root = pathlib.Path(args.output_dir) / "max_emotion"
@@ -763,66 +1158,47 @@ def run_max_emotion_pass(args, trim_window_size, per_class_k: dict | None):
         return
 
     trimmed_output_root.mkdir(parents=True, exist_ok=True)
-    print(f"\n=== Max-emotion pass (k_strategy={args.k_strategy}) ===")
-    print(f"Max-emotion trimmed videos will be saved in: {trimmed_output_root}")
 
     analysis_folders_found = find_analysis_folders_imagenet(pre_analyzed_root)
     if not analysis_folders_found:
         print(f"No '*_analyze' folders found under {pre_analyzed_root}.")
         return
 
-    print(f"Found {len(analysis_folders_found)} pre-analyzed folders to process.")
-
+    # No K/--k_strategy involved here - every class's Phase 1 takes every
+    # threshold-qualifying, non-overlapping window it can find. See the
+    # UNCAPPED_K comment near the top of the file for why.
     tasks_args_list = [
         (
             str(folder_path),
             str(pre_analyzed_root),
             str(source_videos_root),
-            str(trimmed_output_root),
             CLASS_TO_EMOTION_MAP,
             VIDEO_EXTENSIONS,
             EMOTIONS,
             trim_window_size,
-            get_k_for_class(
-                per_class_k, folder_path.parent.name, NUM_TOP_SEGMENTS_TO_SELECT
-            ),
-            MINIMUM_SCORE_FOR_TOP_N_THRESHOLD,
-            FOURCC_CODEC,
-            OUTPUT_VIDEO_EXTENSION,
+            UNCAPPED_K,
+            args.relative_score_floor_fraction,
+            args.absolute_noise_floor,
         )
         for folder_path in analysis_folders_found
     ]
 
     num_processes_to_use = max(1, mp.cpu_count() - 1)
-    print(f"Starting parallel processing with {num_processes_to_use} processes...")
 
-    start_time_script = time.time()
-    with mp.Pool(processes=num_processes_to_use) as pool:
-        results = pool.map(process_single_video_max_emotion_worker, tasks_args_list)
-
-    print("\n" + "=" * 50)
-    print("Max-emotion Pass Summary:")
-
-    successful_results = 0
-    total_segments_saved = 0
-
-    for i, result_summary in enumerate(results, start=1):
-        print(f"  Result for task {i}: {result_summary}")
-        if "Error" not in result_summary and "Skipping" not in result_summary:
-            successful_results += 1
-            total_segments_saved += parse_saved_segment_count(result_summary)
-
-    print(
-        f"\nSuccessfully processed {successful_results} out of {len(tasks_args_list)} analysis folders."
+    run_two_phase_pass(
+        pass_label="Max-emotion",
+        score_worker_fn=score_single_video_max_emotion_worker,
+        tasks_args_list=tasks_args_list,
+        trimmed_output_root=trimmed_output_root,
+        filename_suffix="max_emotion",
+        trim_window_size=trim_window_size,
+        balance_mode=args.balance_mode,
+        higher_is_better=True,
+        num_processes_to_use=num_processes_to_use,
     )
-    print(f"Total segments successfully written: {total_segments_saved}")
-    print(
-        f"Max-emotion pass finished in {time.time() - start_time_script:.2f} seconds."
-    )
-    print(f"Trimmed videos are in: {trimmed_output_root}")
 
 
-def run_min_neutral_pass(args, trim_window_size, per_class_k: dict | None):
+def run_min_neutral_pass(args, trim_window_size):
     source_videos_root = pathlib.Path(args.source_dir)
     pre_analyzed_root = pathlib.Path(args.logs)
     trimmed_output_root = pathlib.Path(args.output_dir) / "min_neutral"
@@ -835,62 +1211,41 @@ def run_min_neutral_pass(args, trim_window_size, per_class_k: dict | None):
         return
 
     trimmed_output_root.mkdir(parents=True, exist_ok=True)
-    print(f"\n=== Min-neutral pass (k_strategy={args.k_strategy}) ===")
-    print(f"Min-neutral trimmed videos will be saved in: {trimmed_output_root}")
 
     analysis_folders_found = find_analysis_folders_imagenet(pre_analyzed_root)
     if not analysis_folders_found:
         print(f"No '*_analyze' folders found under {pre_analyzed_root}.")
         return
 
-    print(f"Found {len(analysis_folders_found)} pre-analyzed folders to process.")
-
+    # No K/--k_strategy involved here either - see run_max_emotion_pass.
     tasks_args_list = [
         (
             str(folder_path),
             str(pre_analyzed_root),
             str(source_videos_root),
-            str(trimmed_output_root),
             VIDEO_EXTENSIONS,
             NEUTRAL_EMOTION_COLUMN,
             trim_window_size,
-            get_k_for_class(
-                per_class_k, folder_path.parent.name, NUM_TOP_SEGMENTS_TO_SELECT
-            ),
-            MAXIMUM_SCORE_FOR_MIN_NEUTRAL_THRESHOLD,
-            FOURCC_CODEC,
-            OUTPUT_VIDEO_EXTENSION,
+            UNCAPPED_K,
+            args.relative_neutral_ceiling_slack_fraction,
+            args.absolute_neutral_ceiling_backstop,
         )
         for folder_path in analysis_folders_found
     ]
 
     num_processes_to_use = int(os.environ.get("SLURM_CPUS_PER_TASK", mp.cpu_count()))
-    print(f"Starting parallel processing with {num_processes_to_use} processes...")
 
-    start_time_script = time.time()
-    with mp.Pool(processes=num_processes_to_use) as pool:
-        results = pool.map(process_single_video_min_neutral_worker, tasks_args_list)
-
-    print("\n" + "=" * 50)
-    print("Min-neutral Pass Summary:")
-
-    successful_results = 0
-    total_segments_saved = 0
-
-    for i, result_summary in enumerate(results, start=1):
-        print(f"  Result for task {i}: {result_summary}")
-        if "Error" not in result_summary and "Skipping" not in result_summary:
-            successful_results += 1
-            total_segments_saved += parse_saved_segment_count(result_summary)
-
-    print(
-        f"\nSuccessfully processed {successful_results} out of {len(tasks_args_list)} analysis folders."
+    run_two_phase_pass(
+        pass_label="Min-neutral",
+        score_worker_fn=score_single_video_min_neutral_worker,
+        tasks_args_list=tasks_args_list,
+        trimmed_output_root=trimmed_output_root,
+        filename_suffix="min_neutral",
+        trim_window_size=trim_window_size,
+        balance_mode=args.balance_mode,
+        higher_is_better=False,
+        num_processes_to_use=num_processes_to_use,
     )
-    print(f"Total segments successfully written: {total_segments_saved}")
-    print(
-        f"Min-neutral pass finished in {time.time() - start_time_script:.2f} seconds."
-    )
-    print(f"Trimmed videos are in: {trimmed_output_root}")
 
 
 def run_random_pass(args, trim_window_size, per_class_k: dict | None):
@@ -959,7 +1314,8 @@ def run_random_pass(args, trim_window_size, per_class_k: dict | None):
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Temporal distillation: max-emotion, min-neutral, and/or random trimming, "
-        "with optional per-class K balancing for imbalanced DFER datasets."
+        "with per-class K oversampling AND class-wide top-K undersampling for imbalanced "
+        "DFER datasets."
     )
     parser.add_argument(
         "--mode",
@@ -1001,22 +1357,75 @@ def get_args() -> argparse.Namespace:
         type=str,
         choices=K_STRATEGY_CHOICES,
         default="auto_balance",
-        help="How many segments (K) to select per class. "
-        "'fixed' (default): one global K for every class, identical to the "
-        "original behaviour (NUM_TOP_SEGMENTS_TO_SELECT / NUM_RANDOM_SEGMENTS_TO_SAMPLE). "
-        "'manual_balance': supply K per class by hand via --manual_k. "
-        "'auto_balance': K is computed automatically from class video counts so "
-        "that total extracted clips per class trend toward parity (minority "
-        "classes are oversampled).",
+        help="How large a CANDIDATE pool (K) to gather per video, per class, before "
+        "class-wide balancing. ONLY APPLIES TO THE RANDOM PASS - max_emotion and "
+        "min_neutral no longer use K at all; every class there takes every "
+        "threshold-qualifying, non-overlapping window it can find, then "
+        "--balance_mode syncs all classes down to the smallest class's true "
+        "total (see module docstring near UNCAPPED_K). 'fixed': one global K "
+        "for every class. 'manual_balance': supply K per class by hand via "
+        "--manual_k. 'auto_balance' (default): K is computed automatically "
+        "from class video counts so total candidates per class trend toward "
+        "parity.",
     )
     parser.add_argument(
         "--manual_k",
         type=str,
         default=None,
-        help="Only used when --k_strategy manual_balance. Comma-separated "
+        help="Only used when --k_strategy manual_balance (which, like all of "
+        "--k_strategy, only affects the random pass). Comma-separated "
         "'class=K' pairs, e.g. \"happy=5,sad=20,angry=15,disgust=40\". "
         "Classes not listed fall back to the default base K "
-        "(NUM_TOP_SEGMENTS_TO_SELECT / NUM_RANDOM_SEGMENTS_TO_SAMPLE).",
+        "(NUM_RANDOM_SEGMENTS_TO_SAMPLE).",
+    )
+    parser.add_argument(
+        "--balance_mode",
+        type=str,
+        choices=BALANCE_MODE_CHOICES,
+        default=DEFAULT_BALANCE_MODE,
+        help="Final class-wide balancing step for max_emotion and min_neutral "
+        "passes, applied AFTER every class's Phase 1 has taken every "
+        "threshold-qualifying, non-overlapping window it can find (--relative_"
+        "score_floor_fraction / --relative_neutral_ceiling_slack_fraction). "
+        "'global_topk' (default): target_count = size of the smallest class's "
+        "candidate pool; any class with more candidates than target_count is "
+        "trimmed down to its class-wide best target_count candidates by score "
+        "(pooled across all videos in that class). Classes at or below "
+        "target_count keep everything. 'none': keep every qualified candidate "
+        "K/gating produced, with no cross-class trimming (old behaviour).",
+    )
+    parser.add_argument(
+        "--relative_score_floor_fraction",
+        type=float,
+        default=RELATIVE_SCORE_FLOOR_FRACTION,
+        help="Max-emotion pass: a candidate window qualifies only if its mean "
+        "target-emotion score is >= this fraction of the BEST window found "
+        "in that same video (default: %(default)s). Set to 0.0 to disable "
+        "relative filtering entirely (only --absolute_noise_floor still applies).",
+    )
+    parser.add_argument(
+        "--absolute_noise_floor",
+        type=float,
+        default=ABSOLUTE_NOISE_FLOOR,
+        help="Max-emotion pass: absolute backstop (0-100 scale) below which a "
+        "window is never accepted, regardless of the relative floor "
+        "(default: %(default)s).",
+    )
+    parser.add_argument(
+        "--relative_neutral_ceiling_slack_fraction",
+        type=float,
+        default=RELATIVE_NEUTRAL_CEILING_SLACK_FRACTION,
+        help="Min-neutral pass: a candidate window qualifies only if its mean "
+        "neutral score is <= the video's own lowest (best/least-neutral) "
+        "window score, plus this fraction of slack (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--absolute_neutral_ceiling_backstop",
+        type=float,
+        default=ABSOLUTE_NEUTRAL_CEILING_BACKSTOP,
+        help="Min-neutral pass: absolute backstop (0-100 scale) above which a "
+        "window is never accepted, regardless of the relative ceiling "
+        "(default: %(default)s).",
     )
     return parser.parse_args()
 
@@ -1033,23 +1442,27 @@ if __name__ == "__main__":
     output_root = pathlib.Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # Resolve the per-class K map once, up front, so every pass uses the
-    # same balancing decision.
-    per_class_k_map = resolve_per_class_k(
-        k_strategy=args.k_strategy,
-        base_k=NUM_TOP_SEGMENTS_TO_SELECT,
-        manual_k_string=args.manual_k,
-        source_root=pathlib.Path(args.source_dir),
-        video_extensions=VIDEO_EXTENSIONS,
-    )
+    # K/--k_strategy is only meaningful for the random pass now (max_emotion
+    # and min_neutral are fully uncapped - see the UNCAPPED_K comment near
+    # the top of the file). Only resolve it - and only require --manual_k
+    # for manual_balance - when random is actually going to run.
+    per_class_k_map = None
+    if args.mode in ("random", "both"):
+        per_class_k_map = resolve_per_class_k(
+            k_strategy=args.k_strategy,
+            base_k=NUM_TOP_SEGMENTS_TO_SELECT,
+            manual_k_string=args.manual_k,
+            source_root=pathlib.Path(args.source_dir),
+            video_extensions=VIDEO_EXTENSIONS,
+        )
 
     overall_start = time.time()
 
     if args.mode in ("max_emotion", "both"):
-        run_max_emotion_pass(args, TRIM_WINDOW_SIZE, per_class_k_map)
+        run_max_emotion_pass(args, TRIM_WINDOW_SIZE)
 
     if args.mode in ("min_neutral", "both"):
-        run_min_neutral_pass(args, TRIM_WINDOW_SIZE, per_class_k_map)
+        run_min_neutral_pass(args, TRIM_WINDOW_SIZE)
 
     if args.mode in ("random", "both"):
         run_random_pass(args, TRIM_WINDOW_SIZE, per_class_k_map)
