@@ -29,7 +29,7 @@ from transformers import (
 
 hf_logging.set_verbosity_error()
 
-from sklearn.model_selection import train_test_split, StratifiedGroupKFold
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -102,161 +102,33 @@ def filter_none_collate(batch):
 
 
 # ---------------------------------------------------------------------------
-# Source-video grouping (prevents train/val/test leakage across clips drawn
-# from the same source video)
+# Train/val/test splitting
 # ---------------------------------------------------------------------------
-# The distillation preprocessing script (max_emotion / center_clips / random
-# passes) can emit multiple non-overlapping clips per source video, named
-# "<video_stem>_<mode>_<index>.mp4" e.g. "00123_max_emotion_1.mp4",
-# "00123_max_emotion_2.mp4", "00123_center_3.mp4", "00123_rnd_2.mp4". Clips
-# sharing a video_stem come from the same subject / recording session /
-# emotional episode, so a label-only stratified split (the original
-# behavior) can put clip 1 of a video in train and clip 2 of the *same*
-# video in test -- letting the model partly "recognize" the subject/scene
-# rather than generalizing, which inflates reported metrics.
-# _SOURCE_ID_SUFFIXES lists every mode suffix the preprocessing script can
-# produce; extend this list if new modes are added.
-#
-# NOTE: "min_neutral" was removed and "center" (center_clips pass) added to
-# match the updated preprocessing script (min-neutral scoring was dropped in
-# favor of a fixed, per-video closest-to-midpoint "center" strategy).
-_SOURCE_ID_SUFFIXES = ["max_emotion", "center", "rnd"]
-_SOURCE_ID_PATTERNS = [
-    re.compile(rf"^(.*)_{re.escape(suffix)}_\d+$") for suffix in _SOURCE_ID_SUFFIXES
-]
-_SOURCE_ID_AND_INDEX_PATTERNS = [
-    re.compile(rf"^(.*)_{re.escape(suffix)}_(\d+)$") for suffix in _SOURCE_ID_SUFFIXES
-]
-
-
-def extract_source_id_and_clip_index(filename):
+# NOTE (ablation mode): this script intentionally performs a plain,
+# label-stratified split over individual clips, with NO source-video
+# grouping. Multiple clips distilled from the same source video (e.g.
+# "00123_max_emotion_1.mp4", "00123_max_emotion_2.mp4", "00123_center_3.mp4")
+# are treated as fully independent samples and may end up on *both* sides of
+# a split. This is deliberate for this run (an ablation comparing against a
+# grouped/leakage-safe split) -- it will inflate reported metrics relative to
+# a properly grouped split, since the model can partially "recognize" a
+# subject/scene it has already seen. Do not use these numbers as a
+# generalization estimate; they exist only for the ablation comparison.
+def stratified_split(indices, labels, test_size, random_state):
     """
-    Extracts both the original source-video stem AND the trailing per-mode
-    clip index (the integer after the mode suffix, e.g. 2 for
-    "..._max_emotion_2.mp4") from a distilled clip filename. video_stem
-    itself may contain underscores, so this anchors on the known suffix
-    tokens rather than naively splitting on the last N underscores (verified
-    against the exact naming used by save_qualified_segments /
-    process_single_video_random_worker / process_single_video_center_worker
-    in the preprocessing script).
-
-    extract_source_id() is implemented in terms of this function so the two
-    can never disagree about which suffix pattern matched.
-
-    Raises ValueError if no known suffix pattern matches, rather than
-    silently falling back to treating the clip as its own singleton group --
-    a silent fallback could quietly reintroduce leakage (a source video with
-    an unrecognized naming convention would never be grouped with its
-    siblings) without any visible signal that something is wrong. If you add
-    a new preprocessing mode, add its suffix to _SOURCE_ID_SUFFIXES first.
+    Plain label-stratified split over individual clip indices. No grouping
+    by source video -- clips from the same source video may land on both
+    sides of the split.
     """
-    stem = os.path.splitext(os.path.basename(filename))[0]
-    for pattern in _SOURCE_ID_AND_INDEX_PATTERNS:
-        m = pattern.match(stem)
-        if m:
-            return m.group(1), int(m.group(2))
-    raise ValueError(
-        f"extract_source_id_and_clip_index: filename '{filename}' (stem '{stem}') does not "
-        f"match any known suffix pattern {_SOURCE_ID_SUFFIXES}. Refusing to silently treat "
-        f"this as an ungrouped singleton, since that could reintroduce train/val/test leakage "
-        f"for this source video. Add its suffix convention to _SOURCE_ID_SUFFIXES if this is "
-        f"a legitimate new preprocessing mode."
-    )
-
-
-def extract_source_id(filename):
-    """
-    Extracts the original source-video stem from a distilled clip filename by
-    stripping the known trailing "_<mode>_<index>" suffix. See
-    extract_source_id_and_clip_index for the full explanation; this is a
-    thin wrapper that discards the clip index.
-    """
-    source_id, _clip_index = extract_source_id_and_clip_index(filename)
-    return source_id
-
-
-def build_source_groups(video_files):
-    """
-    Returns an array of source-video group IDs, one per entry in
-    `video_files` (a list of (path, label) tuples, in the same order as
-    dataset indices), for use with StratifiedGroupKFold / group-aware splits.
-    """
-    return np.array([extract_source_id(path) for path, _ in video_files])
-
-
-def assert_no_group_leakage(indices_a, indices_b, groups, label_a="split A", label_b="split B"):
-    """
-    Hard, loud sanity check: raises AssertionError immediately if any source
-    -video group ID appears in both `indices_a` and `indices_b`. `groups`
-    must be indexable by the *global* indices contained in indices_a/indices_b
-    (i.e. the full-dataset groups array, not a pre-sliced one). Call this
-    after every grouped_stratified_split -- it's cheap (set intersection) and
-    turns a silent leakage regression into an immediate, unmissable failure
-    rather than an inflated metric discovered much later.
-    """
-    groups_a = set(groups[i] for i in indices_a)
-    groups_b = set(groups[i] for i in indices_b)
-    overlap = groups_a & groups_b
-    assert not overlap, (
-        f"LEAKAGE DETECTED between {label_a} and {label_b}: {len(overlap)} source-video "
-        f"group(s) appear in both splits (e.g. {sorted(overlap)[:5]}...). This means clips "
-        f"from the same source video ended up on both sides of the split, which will "
-        f"inflate reported metrics. This should be impossible after grouped_stratified_split "
-        f"-- if you see this, check that `groups` passed to assert_no_group_leakage matches "
-        f"the same indexing used to build the split."
-    )
-
-
-def grouped_stratified_split(indices, labels, groups, test_size, random_state, n_splits=5):
-    """
-    Splits `indices` into two groups, stratified by `labels` and respecting
-    `groups` (no group ID appears in both halves) -- replaces plain
-    train_test_split wherever multiple clips can share a source video.
-
-    Implemented via StratifiedGroupKFold: request enough folds that one fold
-    is approximately `test_size` of the data, then use that single fold as
-    the held-out half. This still gives a single deterministic split (not
-    full k-fold CV) when called with the default n_splits=5 for a ~20% split;
-    pass a different n_splits if you need a different split fraction (e.g.
-    n_splits=4 for a 25% split). random_state controls which fold is treated
-    as "first" via the shuffle, so it plays the same role as in
-    train_test_split.
-    """
-    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     indices = np.asarray(indices)
     labels = np.asarray(labels)
-    train_relative_idx, test_relative_idx = next(
-        sgkf.split(indices, labels, groups=groups)
+    train_idx, test_idx = train_test_split(
+        indices,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=labels,
     )
-    return indices[train_relative_idx].tolist(), indices[test_relative_idx].tolist()
-
-
-def filter_test_indices_top_clip_only(test_indices, video_files):
-    """
-    Restricts a test-index list to only the "_1" indexed clip per source
-    video, independently per mode (e.g. keeps "<stem>_max_emotion_1" and
-    "<stem>_center_1" and "<stem>_rnd_1" if all exist for a video, but
-    drops "_max_emotion_2", "_max_emotion_3", etc.). There is no meaningful
-    way to rank "_max_emotion_1" against "_rnd_1" against each other (they
-    are scored on different, incomparable criteria -- see
-    score_single_video_max_emotion_worker / process_single_video_center_worker /
-    process_single_video_random_worker in the preprocessing script), so "top
-    clip" is defined per-mode, not as a single global winner per video.
-
-    This only ever removes clips from the test set -- it never adds a clip,
-    never moves a clip between train/val/test, and never changes which
-    source videos are considered test videos. Because it operates on a
-    subset of an already group-disjoint split, it cannot reintroduce
-    train/val/test leakage (removing elements from one side of a disjoint
-    partition can't create overlap with the other side).
-    """
-    filtered = []
-    for idx in test_indices:
-        path, _label = video_files[idx]
-        _source_id, clip_index = extract_source_id_and_clip_index(path)
-        if clip_index == 1:
-            filtered.append(idx)
-    return filtered
+    return train_idx.tolist(), test_idx.tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -668,19 +540,6 @@ def get_args():
         "80/20 split, and reports mean +/- std per-class metrics across folds. "
         "Recommended for small classes (e.g. ~39 samples) where a single split "
         "gives a high-variance, less defensible estimate.",
-    )
-
-    # --- Test-set clip thinning -------------------------------------------
-    parser.add_argument(
-        "--test_top_clip_only",
-        action="store_true",
-        help="If set, restrict the held-out test set to only the '_1' indexed clip "
-        "per source video, independently per mode present (e.g. keep "
-        "<stem>_max_emotion_1 and <stem>_center_1 and <stem>_rnd_1, but drop "
-        "_max_emotion_2, _max_emotion_3, ...). Train/val are completely unaffected "
-        "and still use all K clips per video; this does NOT change which source "
-        "videos are assigned to train/val/test -- see filter_test_indices_top_clip_only. "
-        "Default: off (original behavior -- all clips from test videos are used).",
     )
 
     return parser.parse_args()
@@ -1142,30 +1001,20 @@ def save_test_results(model, loader, device, label_map, save_dir, suffix=""):
 
 
 def run_train(args, full_dataset, train_indices_full, device, fold_id=1):
-    """Single stratified train/val split (optionally one fold of a larger k-fold CV loop),
-    grouped by source video so clips from the same original video never span
-    both train and val (see grouped_stratified_split / extract_source_id)."""
-    cv_labels = [full_dataset.video_files[i][1] for i in train_indices_full]
-    # Full-dataset-length lookup (indexable by the global indices that
-    # grouped_stratified_split returns), not positionally indexed over
-    # train_indices_full -- this must match how assert_no_group_leakage
-    # looks up group IDs below.
-    full_groups = build_source_groups(full_dataset.video_files)
-    cv_groups = full_groups[train_indices_full]
+    """Single stratified train/val split (optionally one fold of a larger k-fold CV loop).
 
-    # n_splits derived from val_split so the held-out fold approximates the
-    # requested fraction (e.g. val_split=0.2 -> n_splits=5 -> ~20% held out).
-    val_n_splits = max(2, round(1.0 / args.val_split))
-    actual_train_idx, actual_val_idx = grouped_stratified_split(
+    NOTE (ablation mode): this is a plain label-stratified split over
+    individual clips -- see stratified_split(). No source-video grouping is
+    applied, so clips from the same source video may appear on both sides of
+    this train/val split.
+    """
+    cv_labels = [full_dataset.video_files[i][1] for i in train_indices_full]
+
+    actual_train_idx, actual_val_idx = stratified_split(
         train_indices_full,
         cv_labels,
-        cv_groups,
         test_size=args.val_split,
         random_state=args.seed,
-        n_splits=val_n_splits,
-    )
-    assert_no_group_leakage(
-        actual_train_idx, actual_val_idx, full_groups, label_a="train", label_b="val"
     )
 
     print(f"\n[Fold {fold_id}] Split -> Train: {len(actual_train_idx)} | Val: {len(actual_val_idx)}")
@@ -1430,11 +1279,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(
-        f"--- TimeSformer Training ---\nModel: {args.model_name}\nVal Split: {args.val_split}\n"
+        f"--- TimeSformer Training (ABLATION: ungrouped random split) ---\n"
+        f"Model: {args.model_name}\nVal Split: {args.val_split}\n"
         f"Class weight scheme: {args.class_weight_scheme}\nLoss: {args.loss_type}\n"
         f"Weighted sampler: {args.use_weighted_sampler}\nAugmentation: {args.augment}\n"
-        f"Freeze epochs: {args.freeze_epochs}\nFolds: {args.n_folds}\n"
-        f"Test top-clip-only: {args.test_top_clip_only}\nDevice: {device}"
+        f"Freeze epochs: {args.freeze_epochs}\nFolds: {args.n_folds}\nDevice: {device}"
     )
 
     processor = load_processor(args.model_name)
@@ -1455,91 +1304,17 @@ def main():
 
     all_indices = list(range(len(dataset)))
     all_labels = [x[1] for x in dataset.video_files]
-    all_groups = build_source_groups(dataset.video_files)
 
-    n_unique_sources = len(set(all_groups))
-    print(
-        f"Dataset has {len(all_indices)} clips from {n_unique_sources} unique source "
-        f"videos ({len(all_indices) / n_unique_sources:.1f} clips/video on average)."
-    )
-
-    # NOTE: split_seed is intentionally independent of --seed, so the held-out
-    # test set stays fixed even if you sweep training seeds for variance runs.
-    # Grouped by source video (see extract_source_id) so multiple clips drawn
-    # from the same original video (e.g. via the max_emotion/center/random
-    # distillation passes with k>1) can never span both the CV pool and the
-    # test set -- doing so would let the model partly recognize the subject/
-    # scene instead of generalizing, inflating reported metrics.
-    test_n_splits = max(2, round(1.0 / args.test_split))
-    cv_indices, test_indices = grouped_stratified_split(
+    # NOTE (ablation mode): plain label-stratified split over individual
+    # clips, with NO source-video grouping -- clips from the same source
+    # video can land on both sides of the CV-pool / test-set split. This is
+    # intentional for this ablation run; see stratified_split() docstring.
+    cv_indices, test_indices = stratified_split(
         all_indices,
         all_labels,
-        all_groups,
         test_size=args.test_split,
         random_state=args.split_seed,
-        n_splits=test_n_splits,
     )
-    assert_no_group_leakage(
-        cv_indices, test_indices, all_groups, label_a="CV pool", label_b="held-out test set"
-    )
-    print(
-        f"Verified: zero source-video overlap between CV pool ({len(set(all_groups[i] for i in cv_indices))} "
-        f"unique videos) and test set ({len(set(all_groups[i] for i in test_indices))} unique videos)."
-    )
-
-    # --- Optional: thin the test set down to one clip per mode per video ---
-    # This ONLY removes clips from the (already-decided) test set; it never
-    # changes which source videos are in train/val/test, and cannot affect
-    # the leakage guarantees above (filtering a subset of a disjoint split
-    # can't create overlap). See filter_test_indices_top_clip_only.
-    if args.test_top_clip_only:
-        pre_filter_test_indices = test_indices
-        pre_filter_test_videos = set(all_groups[i] for i in pre_filter_test_indices)
-
-        test_indices = filter_test_indices_top_clip_only(test_indices, dataset.video_files)
-
-        # --- Sanity checks --------------------------------------------------
-        # 1) Every surviving test clip really is a "_1" clip.
-        surviving_clip_indices = [
-            extract_source_id_and_clip_index(dataset.video_files[i][0])[1] for i in test_indices
-        ]
-        assert all(ci == 1 for ci in surviving_clip_indices), (
-            "test_top_clip_only: filtering left a non-index-1 clip in the test set -- "
-            "this should be impossible, check filter_test_indices_top_clip_only."
-        )
-
-        # 2) No source video was dropped entirely by the filter (every mode's
-        #    numbering always starts at 1 for a video that produced any
-        #    qualified segments in that mode, per save_qualified_segments, so
-        #    filtering to index==1 should never remove a video's only
-        #    representation in the test set -- verify rather than assume).
-        post_filter_test_videos = set(all_groups[i] for i in test_indices)
-        dropped_videos = pre_filter_test_videos - post_filter_test_videos
-        assert not dropped_videos, (
-            f"test_top_clip_only: {len(dropped_videos)} test source video(s) lost ALL "
-            f"representation after filtering to index-1 clips (e.g. {sorted(dropped_videos)[:5]}...). "
-            f"This means one or more test videos never produced a '_1' clip in any mode, "
-            f"which should not be possible given how save_qualified_segments numbers clips. "
-            f"Investigate before trusting held-out test metrics."
-        )
-        assert post_filter_test_videos.issubset(pre_filter_test_videos), (
-            "test_top_clip_only: filtering somehow introduced a source video that wasn't "
-            "in the test set before filtering -- this should be impossible."
-        )
-
-        # 3) Re-verify group-disjointness against the CV pool on the filtered
-        #    indices (filtering a subset of an already-disjoint split can't
-        #    introduce leakage, but this is cheap and removes any doubt).
-        assert_no_group_leakage(
-            cv_indices, test_indices, all_groups,
-            label_a="CV pool", label_b="held-out test set (top-clip-only)",
-        )
-
-        print(
-            f"--test_top_clip_only: reduced test set from {len(pre_filter_test_indices)} to "
-            f"{len(test_indices)} clips ({len(post_filter_test_videos)} source videos retained, "
-            f"same as before filtering)."
-        )
 
     test_sub = Subset(dataset, test_indices)
     test_ds = AugmentWrapper(test_sub, augment=False)
@@ -1578,35 +1353,22 @@ def main():
         save_test_results(model, test_loader, device, dataset.label_map, args.save_dir)
 
     else:
-        # Stratified, group-aware k-fold CV over the CV pool. Each fold reuses
-        # the *same* held-out test set (carved out once above, grouped by
-        # source video), and each fold's best model is separately evaluated
-        # on it -- giving mean +/- std test metrics, which is what makes
-        # small-class numbers (e.g. disgust) defensible rather than a single
-        # volatile split.
-        #
-        # NOTE: this loop does not slice cv_indices into per-fold subsets
-        # itself -- each call to run_train() receives the *full* CV pool and
-        # performs its own internal grouped train/val split (see
-        # grouped_stratified_split in run_train). What varies per fold here
-        # is fold_args.seed, which changes which source videos land in that
-        # fold's internal val split. StratifiedGroupKFold is only used to
-        # determine how many folds are requested / provide a consistent,
-        # reproducible seed rotation; it is intentionally not used to assign
-        # disjoint fold membership across iterations.
+        # Stratified k-fold CV over the CV pool (no grouping -- ablation
+        # mode). Each fold reuses the same held-out test set (carved out
+        # once above), and each fold's best model is separately evaluated
+        # on it -- giving mean +/- std test metrics.
         cv_labels = [dataset.video_files[i][1] for i in cv_indices]
-        cv_groups = build_source_groups([dataset.video_files[i] for i in cv_indices])
-        sgkf = StratifiedGroupKFold(n_splits=args.n_folds, shuffle=True, random_state=args.split_seed)
+        skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.split_seed)
 
         fold_reports = []
         fold_summaries = []
         cv_indices_arr = np.array(cv_indices)
 
         for fold_id, (_, fold_val_relative_idx) in enumerate(
-            sgkf.split(cv_indices_arr, cv_labels, groups=cv_groups), start=1
+            skf.split(cv_indices_arr, cv_labels), start=1
         ):
-            # See note above: fold_val_relative_idx is intentionally unused --
-            # run_train performs its own grouped train/val split internally.
+            # fold_val_relative_idx is intentionally unused -- run_train
+            # performs its own stratified train/val split internally.
             fold_args = argparse.Namespace(**vars(args))
             fold_args.seed = args.seed + fold_id  # vary the internal train/val carve per fold
 

@@ -13,19 +13,23 @@ from collections import defaultdict
 # =========================================================================
 
 CLASS_TO_EMOTION_MAP = {
-    "angry": "angry",
+    "amusement": "happy",
+    "liking": "happy",
+    "enthusiasm": "happy",
+    "awe": "surprise",
+    "surprise": "surprise",
+    "anger": "angry",
     "disgust": "disgust",
     "fear": "fear",
-    "happy": "happy",
-    "sad": "sad",
-    "surprise": "surprise",
+    "sadness": "sad",
     "neutral": "neutral",
 }
+
 
 VIDEO_EXTENSIONS = [".mp4", ".avi", ".mov"]
 EMOTIONS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
 
-NUM_TOP_SEGMENTS_TO_SELECT = 10
+NUM_TOP_SEGMENTS_TO_SELECT = 1
 
 # ---- Score gating (max-emotion pass) ----
 # Scores in emotion_data.csv are on a 0-100 scale. Emotions like "happy" or
@@ -42,27 +46,45 @@ NUM_TOP_SEGMENTS_TO_SELECT = 10
 # ABSOLUTE_NOISE_FLOOR is a small absolute backstop so that a window is
 # never accepted if it's genuinely ~0 signal (e.g. best window itself is
 # essentially noise).
-RELATIVE_SCORE_FLOOR_FRACTION = 0.05
+RELATIVE_SCORE_FLOOR_FRACTION = 0
 ABSOLUTE_NOISE_FLOOR = 0.01
 
-# ---- Score gating (min-neutral pass) ----
-# Mirrors the logic above but as a ceiling: a window qualifies only if its
-# neutral-score is close to that video's own *lowest* (best/least-neutral)
-# window, rather than needing to clear a single fixed global ceiling that
-# may be trivial or impossible depending on how "neutral-heavy" a given
-# video happens to be.
-NEUTRAL_EMOTION_COLUMN = "neutral"
-RELATIVE_NEUTRAL_CEILING_SLACK_FRACTION = 0.05
-ABSOLUTE_NEUTRAL_CEILING_BACKSTOP = 99.99
-
 NUM_RANDOM_SEGMENTS_TO_SAMPLE = NUM_TOP_SEGMENTS_TO_SELECT
+
+# ---- Center-clips pass ----
+# center_clips needs no emotion CSV / pre-analyzed data at all: it simply
+# picks the K non-overlapping windows whose midpoint is closest to the
+# video's own temporal midpoint, regardless of emotion score. It is a
+# single-phase, per-video pass (like random), not a two-phase scored +
+# class-balanced pass (like max_emotion), since there is no score to
+# balance across classes - every video contributes up to the same fixed K.
+NUM_CENTER_SEGMENTS_TO_SELECT = NUM_TOP_SEGMENTS_TO_SELECT
 
 FOURCC_CODEC = cv2.VideoWriter_fourcc(*"mp4v")
 OUTPUT_VIDEO_EXTENSION = ".mp4"
 
+# ---- Video I/O backend ----
+# Force FFMPEG explicitly instead of letting OpenCV auto-select (which, on
+# many Linux builds, picks GStreamer). On a truncated/corrupted file
+# ("moov atom not found"), the GStreamer backend can leave a pipeline in a
+# bad state (READY instead of NULL) instead of failing cleanly, which has
+# been observed to hang cv2.VideoCapture indefinitely under heavy
+# multiprocessing. FFMPEG fails fast and cleanly on the same files.
+VIDEO_CAPTURE_BACKEND = cv2.CAP_FFMPEG
+
+# ---- Process pool sizing for video-I/O passes ----
+# max_emotion's Phase 1 (CSV scoring) is cheap and CPU-light, so a large
+# pool is fine there. center_clips and random, however, have every worker
+# opening/reading/writing actual video files concurrently - with a huge
+# process count this creates heavy contention on the video backend and
+# makes any single stuck file much more likely to stall the whole pool.
+# Cap those two passes' pool size independently of CPU count.
+MAX_VIDEO_IO_PROCESSES = 32
+
 # ---- K-strategy modes ----
-# K-strategy ONLY applies to the random pass now (see history below). It has
-# no effect on max_emotion / min_neutral.
+# K-strategy ONLY applies to the random pass. It has no effect on
+# max_emotion (fully uncapped, see UNCAPPED_K below) or on center_clips
+# (fixed per-video K, no cross-class balancing at all).
 # "fixed"           : a single global K for every class (candidate-pool size
 #                      per video before class-wide balancing kicks in).
 # "manual_balance"  : per-class K supplied by hand as a hyperparameter.
@@ -72,26 +94,26 @@ OUTPUT_VIDEO_EXTENSION = ".mp4"
 #                      before the final class-wide balancing step.
 K_STRATEGY_CHOICES = ["fixed", "manual_balance", "auto_balance"]
 
-# ---- Uncapped K for max_emotion / min_neutral (all classes) ----
-# max_emotion and min_neutral no longer use K/--k_strategy at all. Every
-# class's Phase 1 pulls every threshold-qualifying, non-overlapping window it
-# can produce, full stop. Rationale: apply_global_topk_balance()'s
-# target_count is min() across all classes' candidate pools - so whichever
-# class is smallest effectively sets the ceiling every other class gets
-# trimmed down to. Any K cap - even one that's *not* the tightest class - can
-# only ever push a class's pool down, never up, so a too-conservative K
-# (a bad auto_balance estimate, or an under-set --manual_k) can quietly
-# produce a false minimum that global_topk has no way to detect or correct
-# (it only trims classes ABOVE target_count, never pads classes below it).
-# Removing K entirely for every class removes that failure mode: each
-# class's pool becomes its true ceiling (threshold + non-overlap, nothing
-# else), target_count becomes the true achievable minimum across classes,
-# and every class is synced to exactly that. UNCAPPED_K is a sentinel
-# consumed by select_non_overlapping_segments(), where it simply never
-# triggers the early-stop, so every qualifying window is kept.
+# ---- Uncapped K for max_emotion (all classes) ----
+# max_emotion no longer uses K/--k_strategy at all. Every class's Phase 1
+# pulls every threshold-qualifying, non-overlapping window it can produce,
+# full stop. Rationale: apply_global_topk_balance()'s target_count is
+# min() across all classes' candidate pools - so whichever class is
+# smallest effectively sets the ceiling every other class gets trimmed
+# down to. Any K cap - even one that's *not* the tightest class - can only
+# ever push a class's pool down, never up, so a too-conservative K (a bad
+# auto_balance estimate, or an under-set --manual_k) can quietly produce a
+# false minimum that global_topk has no way to detect or correct (it only
+# trims classes ABOVE target_count, never pads classes below it). Removing
+# K entirely for every class removes that failure mode: each class's pool
+# becomes its true ceiling (threshold + non-overlap, nothing else),
+# target_count becomes the true achievable minimum across classes, and
+# every class is synced to exactly that. UNCAPPED_K is a sentinel consumed
+# by select_non_overlapping_segments(), where it simply never triggers the
+# early-stop, so every qualifying window is kept.
 UNCAPPED_K = float("inf")
 
-# ---- Class-wide balancing (final step for max_emotion / min_neutral) ----
+# ---- Class-wide balancing (final step for max_emotion) ----
 # K-strategy controls how large a CANDIDATE pool each video is allowed to
 # contribute (oversampling minority classes at the per-video level). But if
 # a class has enough videos, even a small per-video K can still add up to
@@ -106,14 +128,13 @@ UNCAPPED_K = float("inf")
 #                    candidate pool (after K-oversampling has done its
 #                    best). Any class with MORE candidates than target_count
 #                    is trimmed down to its class-wide best `target_count`
-#                    candidates by score (highest mean target-emotion score
-#                    for max_emotion, lowest mean neutral score for
-#                    min_neutral) - pooling across ALL videos in that class,
-#                    not per-video. Classes with fewer candidates than
-#                    target_count keep everything they have (can't
-#                    manufacture data that doesn't exist).
+#                    candidates by score (highest mean target-emotion score),
+#                    pooling across ALL videos in that class, not per-video.
+#                    Classes with fewer candidates than target_count keep
+#                    everything they have (can't manufacture data that
+#                    doesn't exist).
 BALANCE_MODE_CHOICES = ["none", "global_topk"]
-DEFAULT_BALANCE_MODE = "global_topk"
+DEFAULT_BALANCE_MODE = "none"
 
 
 # =========================================================================
@@ -164,7 +185,7 @@ def parse_saved_segment_count(result_summary: str) -> int:
 
 def read_video_properties(video_path: pathlib.Path):
     """Open a video just to read fps/width/height/frame-count, then release it."""
-    cap_props = cv2.VideoCapture(str(video_path))
+    cap_props = cv2.VideoCapture(str(video_path), VIDEO_CAPTURE_BACKEND)
     if not cap_props.isOpened():
         return None
     fps = cap_props.get(cv2.CAP_PROP_FPS)
@@ -199,7 +220,7 @@ def write_segment(
         )
         return False
 
-    cap = cv2.VideoCapture(str(original_video_file))
+    cap = cv2.VideoCapture(str(original_video_file), VIDEO_CAPTURE_BACKEND)
     segment_ok = True
 
     if not cap.isOpened():
@@ -267,9 +288,9 @@ def select_non_overlapping_segments(
     """Greedy temporal non-max suppression.
 
     `ordered_segments` must already be sorted by priority (best candidate
-    first — e.g. highest/lowest mean score, or a random shuffle). Walk the
-    list in that order; keep a candidate only if it shares no frame with any
-    segment already selected, i.e. reject it if
+    first — e.g. highest/lowest mean score, closest-to-center distance, or a
+    random shuffle). Walk the list in that order; keep a candidate only if
+    it shares no frame with any segment already selected, i.e. reject it if
     candidate.start <= chosen.end AND candidate.end >= chosen.start.
     Stop once `num_segments_to_select` non-overlapping segments are picked
     or the candidate list is exhausted.
@@ -735,165 +756,6 @@ def score_single_video_max_emotion_worker(task_args_tuple):
 
 
 # =========================================================================
-# Min-neutral: Phase 1 (score only, no writing)
-# =========================================================================
-
-
-def score_single_video_min_neutral_worker(task_args_tuple):
-    (
-        analysis_folder_path_str,
-        pre_analyzed_root_str,
-        source_videos_root_str,
-        video_extensions,
-        neutral_column,
-        trim_window_size,
-        num_top_segments,
-        relative_neutral_ceiling_slack_fraction,
-        absolute_neutral_ceiling_backstop,
-    ) = task_args_tuple
-
-    analysis_folder_path = pathlib.Path(analysis_folder_path_str)
-    pre_analyzed_root = pathlib.Path(pre_analyzed_root_str)
-    source_videos_root = pathlib.Path(source_videos_root_str)
-
-    video_stem = analysis_folder_path.name.replace("_analyze", "")
-
-    try:
-        relative_class_dir = analysis_folder_path.parent.relative_to(pre_analyzed_root)
-    except ValueError:
-        return {
-            "status": f"{video_stem}: Error - Analysis folder is not under the analysis root.",
-            "class_name": None,
-            "candidates": [],
-        }
-
-    video_class = analysis_folder_path.parent.name.lower()
-
-    csv_file_path = analysis_folder_path / "emotion_data.csv"
-    if not csv_file_path.exists():
-        return {
-            "status": f"{relative_class_dir}/{video_stem}: Error - CSV not found.",
-            "class_name": video_class,
-            "candidates": [],
-        }
-
-    try:
-        df = pd.read_csv(csv_file_path)
-        if df.empty or "frame" not in df.columns:
-            return {
-                "status": f"{relative_class_dir}/{video_stem}: Error - CSV empty or missing 'frame' column.",
-                "class_name": video_class,
-                "candidates": [],
-            }
-        if neutral_column not in df.columns:
-            return {
-                "status": f"{relative_class_dir}/{video_stem}: Error - '{neutral_column}' column not found in CSV.",
-                "class_name": video_class,
-                "candidates": [],
-            }
-    except Exception as e:
-        return {
-            "status": f"{relative_class_dir}/{video_stem}: Error - CSV read failed: {e}",
-            "class_name": video_class,
-            "candidates": [],
-        }
-
-    original_video_file = find_source_video(
-        source_videos_root, relative_class_dir, video_stem, video_extensions
-    )
-    if original_video_file is None:
-        return {
-            "status": f"{relative_class_dir}/{video_stem}: Error - Original video not found under source class folder.",
-            "class_name": video_class,
-            "candidates": [],
-        }
-
-    props = read_video_properties(original_video_file)
-    if props is None:
-        return {
-            "status": f"{relative_class_dir}/{video_stem}: Error - Could not open/read original video properties.",
-            "class_name": video_class,
-            "candidates": [],
-        }
-    fps, frame_width, frame_height, total_frames_original_video = props
-
-    can_trim_based_on_data = len(df) >= trim_window_size
-    can_trim_based_on_video = total_frames_original_video >= trim_window_size
-    if not (can_trim_based_on_data and can_trim_based_on_video):
-        return {
-            "status": (
-                f"{relative_class_dir}/{video_stem}: Skipping - Not enough frames in CSV "
-                f"({len(df)}) or video ({total_frames_original_video}) for window {trim_window_size}."
-            ),
-            "class_name": video_class,
-            "candidates": [],
-        }
-
-    all_evaluated_segments = evaluate_sliding_windows(
-        df, neutral_column, trim_window_size, total_frames_original_video
-    )
-
-    if not all_evaluated_segments:
-        return {
-            "status": f"{relative_class_dir}/{video_stem}: No valid segments could be evaluated.",
-            "class_name": video_class,
-            "candidates": [],
-        }
-
-    # Lowest mean neutral score first (least neutral / most expressive).
-    all_evaluated_segments.sort(key=lambda x: x["mean_score"])
-    non_overlapping_candidates = select_non_overlapping_segments(
-        all_evaluated_segments, num_top_segments
-    )
-
-    if not non_overlapping_candidates:
-        return {
-            "status": f"{relative_class_dir}/{video_stem}: No non-overlapping candidate segments found.",
-            "class_name": video_class,
-            "candidates": [],
-        }
-
-    best_score_this_video = non_overlapping_candidates[0]["mean_score"]
-    relative_ceiling = min(
-        best_score_this_video + relative_neutral_ceiling_slack_fraction * best_score_this_video,
-        absolute_neutral_ceiling_backstop,
-    )
-
-    qualified_segments = [
-        segment
-        for segment in non_overlapping_candidates
-        if segment["mean_score"] <= relative_ceiling
-    ]
-
-    video_key = f"{relative_class_dir}/{video_stem}"
-    for segment in qualified_segments:
-        segment["video_key"] = video_key
-        segment["class_name"] = video_class
-        segment["video_stem"] = video_stem
-        segment["relative_class_dir"] = str(relative_class_dir)
-        segment["original_video_file"] = str(original_video_file)
-        segment["fps"] = fps
-        segment["frame_width"] = frame_width
-        segment["frame_height"] = frame_height
-
-    status = (
-        f"{video_key}: Scored. {len(qualified_segments)} candidates qualified "
-        f"(relative ceiling {relative_ceiling:.4f}, best window {best_score_this_video:.4f})."
-        if qualified_segments
-        else (
-            f"{video_key}: No segments from bottom {format_k_for_display(num_top_segments)} met relative "
-            f"neutral-score ceiling {relative_ceiling:.4f} (best window: {best_score_this_video:.4f})."
-        )
-    )
-
-    return {
-        "status": status,
-        "class_name": video_class,
-        "candidates": qualified_segments,
-    }
-
-
-# =========================================================================
 # Phase 2 (shared): write the final, balanced candidate set for one video
 # =========================================================================
 
@@ -1046,6 +908,107 @@ def process_single_video_random_worker(task_args_tuple):
 
 
 # =========================================================================
+# Center-clips worker (single phase, like random - no CSV/score involved.
+# Picks the K non-overlapping windows closest to the video's own midpoint.)
+# =========================================================================
+
+
+def process_single_video_center_worker(task_args_tuple):
+    (
+        video_path_str,
+        source_root_str,
+        trimmed_output_root_str,
+        trim_window_size,
+        num_segments,
+        fourcc_codec,
+        output_video_extension,
+    ) = task_args_tuple
+
+    video_path = pathlib.Path(video_path_str)
+    source_root = pathlib.Path(source_root_str)
+    trimmed_output_root = pathlib.Path(trimmed_output_root_str)
+    video_stem = video_path.stem
+    pid = os.getpid()
+    start_time = time.time()
+
+    try:
+        relative_class_dir = video_path.parent.relative_to(source_root)
+    except ValueError:
+        return f"{video_stem}: Error - Video is not under the source root."
+
+    log_prefix = f"{pid}-{relative_class_dir}/{video_stem}"
+
+    class_output_dir = trimmed_output_root / relative_class_dir
+    class_output_dir.mkdir(parents=True, exist_ok=True)
+
+    props = read_video_properties(video_path)
+    if props is None:
+        return f"{relative_class_dir}/{video_stem}: Error - Could not open/read video properties."
+    fps, frame_width, frame_height, total_frames = props
+
+    if total_frames < trim_window_size:
+        return (
+            f"{relative_class_dir}/{video_stem}: Skipped - Video too short "
+            f"({total_frames} frames) for window {trim_window_size}."
+        )
+
+    # Build every valid window as a candidate, then rank by how close its
+    # own midpoint is to the video's midpoint (closest-to-center first), and
+    # run it through the same NMS-style greedy selector every other pass
+    # uses so center picks never overlap each other either. Ties (equally
+    # close on both sides of center) resolve in chronological order because
+    # Python's sort is stable and candidates are built in start-frame order.
+    video_center_frame = total_frames / 2.0
+    max_valid_start_index = total_frames - trim_window_size
+    all_candidate_segments = []
+    for start_idx in range(max_valid_start_index + 1):
+        video_start_frame = start_idx + 1
+        video_end_frame = start_idx + trim_window_size
+        window_center_frame = (video_start_frame + video_end_frame) / 2.0
+        all_candidate_segments.append(
+            {
+                "video_start_frame": video_start_frame,
+                "video_end_frame": video_end_frame,
+                "distance_from_center": abs(window_center_frame - video_center_frame),
+            }
+        )
+
+    all_candidate_segments.sort(key=lambda seg: seg["distance_from_center"])
+
+    selected_segments = select_non_overlapping_segments(
+        all_candidate_segments, num_segments
+    )
+    # Keep chronological order in the output filenames/order.
+    selected_segments.sort(key=lambda seg: seg["video_start_frame"])
+
+    segments_saved_count = 0
+    for i, segment_info in enumerate(selected_segments, start=1):
+        start_frame_zero_based = segment_info["video_start_frame"] - 1
+        output_name = f"{video_stem}_center_{i}{output_video_extension}"
+        output_file_path = class_output_dir / output_name
+
+        ok = write_segment(
+            video_path,
+            output_file_path,
+            start_frame_zero_based,
+            trim_window_size,
+            fps,
+            frame_width,
+            frame_height,
+            fourcc_codec,
+            log_prefix,
+        )
+        if ok:
+            segments_saved_count += 1
+
+    duration = time.time() - start_time
+    return (
+        f"{relative_class_dir}/{video_stem}: Saved {segments_saved_count} center segments "
+        f"in {duration:.2f}s."
+    )
+
+
+# =========================================================================
 # Pass runners
 # =========================================================================
 
@@ -1061,7 +1024,8 @@ def run_two_phase_pass(
     higher_is_better: bool,
     num_processes_to_use: int,
 ):
-    """Shared two-phase driver used by both max_emotion and min_neutral passes.
+    """Shared two-phase driver for score-based, class-balanced passes
+    (currently just max_emotion).
 
     Phase 1: score every video in parallel (no writing).
     Between phases: group candidates by class, apply class-wide balancing.
@@ -1198,54 +1162,60 @@ def run_max_emotion_pass(args, trim_window_size):
     )
 
 
-def run_min_neutral_pass(args, trim_window_size):
-    source_videos_root = pathlib.Path(args.source_dir)
-    pre_analyzed_root = pathlib.Path(args.logs)
-    trimmed_output_root = pathlib.Path(args.output_dir) / "min_neutral"
-
-    if not source_videos_root.is_dir():
-        print(f"Error: Source videos directory not found: {source_videos_root}")
-        return
-    if not pre_analyzed_root.is_dir():
-        print(f"Error: Pre-analyzed data directory not found: {pre_analyzed_root}")
-        return
-
+def run_center_clips_pass(args, trim_window_size):
+    source_root = pathlib.Path(args.source_dir)
+    trimmed_output_root = pathlib.Path(args.output_dir) / "center_clips"
     trimmed_output_root.mkdir(parents=True, exist_ok=True)
 
-    analysis_folders_found = find_analysis_folders_imagenet(pre_analyzed_root)
-    if not analysis_folders_found:
-        print(f"No '*_analyze' folders found under {pre_analyzed_root}.")
+    if not source_root.is_dir():
+        print(f"Error: Source not found: {source_root}")
         return
 
-    # No K/--k_strategy involved here either - see run_max_emotion_pass.
-    tasks_args_list = [
+    print(f"\n=== Center-clips pass (k={NUM_CENTER_SEGMENTS_TO_SELECT}) ===")
+    video_files = collect_videos_imagenet(source_root, VIDEO_EXTENSIONS)
+
+    if not video_files:
+        print(f"No video files found under ImageNet-style root: {source_root}")
+        return
+
+    print(f"Found {len(video_files)} videos under: {source_root}")
+    print(f"Outputting to: {trimmed_output_root}")
+
+    tasks = [
         (
-            str(folder_path),
-            str(pre_analyzed_root),
-            str(source_videos_root),
-            VIDEO_EXTENSIONS,
-            NEUTRAL_EMOTION_COLUMN,
+            str(video_path),
+            str(source_root),
+            str(trimmed_output_root),
             trim_window_size,
-            UNCAPPED_K,
-            args.relative_neutral_ceiling_slack_fraction,
-            args.absolute_neutral_ceiling_backstop,
+            NUM_CENTER_SEGMENTS_TO_SELECT,
+            FOURCC_CODEC,
+            OUTPUT_VIDEO_EXTENSION,
         )
-        for folder_path in analysis_folders_found
+        for video_path in video_files
     ]
 
-    num_processes_to_use = int(os.environ.get("SLURM_CPUS_PER_TASK", mp.cpu_count()))
+    num_procs = min(MAX_VIDEO_IO_PROCESSES, max(1, mp.cpu_count() - 1))
+    print(f"Starting pool with {num_procs} processes...")
 
-    run_two_phase_pass(
-        pass_label="Min-neutral",
-        score_worker_fn=score_single_video_min_neutral_worker,
-        tasks_args_list=tasks_args_list,
-        trimmed_output_root=trimmed_output_root,
-        filename_suffix="min_neutral",
-        trim_window_size=trim_window_size,
-        balance_mode=args.balance_mode,
-        higher_is_better=False,
-        num_processes_to_use=num_processes_to_use,
-    )
+    start_script = time.time()
+    success_count = 0
+    total_segments = 0
+
+    print("\n" + "=" * 50)
+    print("Center-clips Pass Summary:")
+    with mp.Pool(processes=num_procs) as pool:
+        for i, res in enumerate(
+            pool.imap_unordered(process_single_video_center_worker, tasks), start=1
+        ):
+            print(f"  [{i}/{len(tasks)}] Result: {res}")
+            if "Saved" in res:
+                success_count += 1
+                total_segments += parse_saved_segment_count(res)
+
+    print(f"\nProcessed {success_count}/{len(video_files)} videos successfully.")
+    print(f"Total center clips generated: {total_segments}")
+    print(f"Center-clips pass finished in {time.time() - start_script:.2f}s")
+    print(f"Trimmed videos are in: {trimmed_output_root}")
 
 
 def run_random_pass(args, trim_window_size, per_class_k: dict | None):
@@ -1282,23 +1252,23 @@ def run_random_pass(args, trim_window_size, per_class_k: dict | None):
         for video_path in video_files
     ]
 
-    num_procs = max(1, mp.cpu_count() - 1)
+    num_procs = min(MAX_VIDEO_IO_PROCESSES, max(1, mp.cpu_count() - 1))
     print(f"Starting pool with {num_procs} processes...")
 
     start_script = time.time()
-    with mp.Pool(processes=num_procs) as pool:
-        results = pool.map(process_single_video_random_worker, tasks)
-
     success_count = 0
     total_segments = 0
 
     print("\n" + "=" * 50)
     print("Random Pass Summary:")
-    for res in results:
-        print(f"  Result: {res}")
-        if "Saved" in res:
-            success_count += 1
-            total_segments += parse_saved_segment_count(res)
+    with mp.Pool(processes=num_procs) as pool:
+        for i, res in enumerate(
+            pool.imap_unordered(process_single_video_random_worker, tasks), start=1
+        ):
+            print(f"  [{i}/{len(tasks)}] Result: {res}")
+            if "Saved" in res:
+                success_count += 1
+                total_segments += parse_saved_segment_count(res)
 
     print(f"\nProcessed {success_count}/{len(video_files)} videos successfully.")
     print(f"Total random clips generated: {total_segments}")
@@ -1313,17 +1283,17 @@ def run_random_pass(args, trim_window_size, per_class_k: dict | None):
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Temporal distillation: max-emotion, min-neutral, and/or random trimming, "
+        description="Temporal distillation: max-emotion, center-clips, and/or random trimming, "
         "with per-class K oversampling AND class-wide top-K undersampling for imbalanced "
         "DFER datasets."
     )
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["max_emotion", "min_neutral", "random", "both"],
+        choices=["max_emotion", "center_clips", "random", "both"],
         default="both",
         help="Which trimming strategy to run. 'both' runs all three passes "
-        "(max_emotion, min_neutral, random).",
+        "(max_emotion, center_clips, random).",
     )
     parser.add_argument(
         "--source_dir",
@@ -1336,14 +1306,15 @@ def get_args() -> argparse.Namespace:
         type=str,
         required=True,
         help="Root of per-video emotion CSV logs produced by analyze_videos.py. "
-        "Only required for --mode max_emotion, min_neutral, or both.",
+        "Only required for --mode max_emotion or both (center_clips and random "
+        "need no emotion CSV at all).",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         required=True,
         help="Root output directory. Max-emotion clips go in <output_dir>/max_emotion, "
-        "min-neutral clips go in <output_dir>/min_neutral, "
+        "center clips go in <output_dir>/center_clips, "
         "random clips go in <output_dir>/random.",
     )
     parser.add_argument(
@@ -1356,17 +1327,18 @@ def get_args() -> argparse.Namespace:
         "--k_strategy",
         type=str,
         choices=K_STRATEGY_CHOICES,
-        default="auto_balance",
+        default="fixed",
         help="How large a CANDIDATE pool (K) to gather per video, per class, before "
-        "class-wide balancing. ONLY APPLIES TO THE RANDOM PASS - max_emotion and "
-        "min_neutral no longer use K at all; every class there takes every "
-        "threshold-qualifying, non-overlapping window it can find, then "
-        "--balance_mode syncs all classes down to the smallest class's true "
-        "total (see module docstring near UNCAPPED_K). 'fixed': one global K "
-        "for every class. 'manual_balance': supply K per class by hand via "
-        "--manual_k. 'auto_balance' (default): K is computed automatically "
-        "from class video counts so total candidates per class trend toward "
-        "parity.",
+        "class-wide balancing. ONLY APPLIES TO THE RANDOM PASS - max_emotion no "
+        "longer uses K at all; it takes every threshold-qualifying, "
+        "non-overlapping window it can find, then --balance_mode syncs all "
+        "classes down to the smallest class's true total (see module "
+        "docstring near UNCAPPED_K). center_clips also does not use K here - "
+        "its per-video K is the fixed NUM_CENTER_SEGMENTS_TO_SELECT constant. "
+        "'fixed': one global K for every class. 'manual_balance': supply K "
+        "per class by hand via --manual_k. 'auto_balance' (default): K is "
+        "computed automatically from class video counts so total candidates "
+        "per class trend toward parity.",
     )
     parser.add_argument(
         "--manual_k",
@@ -1383,16 +1355,16 @@ def get_args() -> argparse.Namespace:
         type=str,
         choices=BALANCE_MODE_CHOICES,
         default=DEFAULT_BALANCE_MODE,
-        help="Final class-wide balancing step for max_emotion and min_neutral "
-        "passes, applied AFTER every class's Phase 1 has taken every "
-        "threshold-qualifying, non-overlapping window it can find (--relative_"
-        "score_floor_fraction / --relative_neutral_ceiling_slack_fraction). "
+        help="Final class-wide balancing step for the max_emotion pass, applied "
+        "AFTER every class's Phase 1 has taken every threshold-qualifying, "
+        "non-overlapping window it can find (--relative_score_floor_fraction). "
         "'global_topk' (default): target_count = size of the smallest class's "
         "candidate pool; any class with more candidates than target_count is "
         "trimmed down to its class-wide best target_count candidates by score "
         "(pooled across all videos in that class). Classes at or below "
         "target_count keep everything. 'none': keep every qualified candidate "
-        "K/gating produced, with no cross-class trimming (old behaviour).",
+        "K/gating produced, with no cross-class trimming (old behaviour). Does "
+        "not apply to center_clips or random.",
     )
     parser.add_argument(
         "--relative_score_floor_fraction",
@@ -1411,22 +1383,6 @@ def get_args() -> argparse.Namespace:
         "window is never accepted, regardless of the relative floor "
         "(default: %(default)s).",
     )
-    parser.add_argument(
-        "--relative_neutral_ceiling_slack_fraction",
-        type=float,
-        default=RELATIVE_NEUTRAL_CEILING_SLACK_FRACTION,
-        help="Min-neutral pass: a candidate window qualifies only if its mean "
-        "neutral score is <= the video's own lowest (best/least-neutral) "
-        "window score, plus this fraction of slack (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--absolute_neutral_ceiling_backstop",
-        type=float,
-        default=ABSOLUTE_NEUTRAL_CEILING_BACKSTOP,
-        help="Min-neutral pass: absolute backstop (0-100 scale) above which a "
-        "window is never accepted, regardless of the relative ceiling "
-        "(default: %(default)s).",
-    )
     return parser.parse_args()
 
 
@@ -1443,9 +1399,10 @@ if __name__ == "__main__":
     output_root.mkdir(parents=True, exist_ok=True)
 
     # K/--k_strategy is only meaningful for the random pass now (max_emotion
-    # and min_neutral are fully uncapped - see the UNCAPPED_K comment near
-    # the top of the file). Only resolve it - and only require --manual_k
-    # for manual_balance - when random is actually going to run.
+    # is fully uncapped and center_clips uses a fixed constant - see the
+    # comments near UNCAPPED_K and NUM_CENTER_SEGMENTS_TO_SELECT near the
+    # top of the file). Only resolve it - and only require --manual_k for
+    # manual_balance - when random is actually going to run.
     per_class_k_map = None
     if args.mode in ("random", "both"):
         per_class_k_map = resolve_per_class_k(
@@ -1461,8 +1418,8 @@ if __name__ == "__main__":
     if args.mode in ("max_emotion", "both"):
         run_max_emotion_pass(args, TRIM_WINDOW_SIZE)
 
-    if args.mode in ("min_neutral", "both"):
-        run_min_neutral_pass(args, TRIM_WINDOW_SIZE)
+    if args.mode in ("center_clips", "both"):
+        run_center_clips_pass(args, TRIM_WINDOW_SIZE)
 
     if args.mode in ("random", "both"):
         run_random_pass(args, TRIM_WINDOW_SIZE, per_class_k_map)

@@ -114,17 +114,22 @@ def filter_none_collate(batch):
 # Source-video grouping (prevents train/val/test leakage across clips drawn
 # from the same source video)
 # ---------------------------------------------------------------------------
-# The distillation preprocessing script (max_emotion / min_neutral / random
+# The distillation preprocessing script (max_emotion / center_clips / random
 # passes) can emit multiple non-overlapping clips per source video, named
 # "<video_stem>_<mode>_<index>.mp4" e.g. "00123_max_emotion_1.mp4",
-# "00123_max_emotion_2.mp4", "00123_rnd_3.mp4". Clips sharing a video_stem
-# come from the same subject / recording session / emotional episode, so a
-# label-only stratified split (the original behavior) can put clip 1 of a
-# video in train and clip 2 of the *same* video in test -- letting the model
-# partly "recognize" the subject/scene rather than generalizing, which
-# inflates reported metrics. _SOURCE_ID_SUFFIXES lists every mode suffix the
-# preprocessing script can produce; extend this list if new modes are added.
-_SOURCE_ID_SUFFIXES = ["max_emotion", "min_neutral", "rnd"]
+# "00123_max_emotion_2.mp4", "00123_center_3.mp4", "00123_rnd_2.mp4". Clips
+# sharing a video_stem come from the same subject / recording session /
+# emotional episode, so a label-only stratified split (the original
+# behavior) can put clip 1 of a video in train and clip 2 of the *same*
+# video in test -- letting the model partly "recognize" the subject/scene
+# rather than generalizing, which inflates reported metrics.
+# _SOURCE_ID_SUFFIXES lists every mode suffix the preprocessing script can
+# produce; extend this list if new modes are added.
+#
+# NOTE: "min_neutral" was removed and "center" (center_clips pass) added to
+# match the updated preprocessing script (min-neutral scoring was dropped in
+# favor of a fixed, per-video closest-to-midpoint "center" strategy).
+_SOURCE_ID_SUFFIXES = ["max_emotion", "center", "rnd"]
 _SOURCE_ID_PATTERNS = [
     re.compile(rf"^(.*)_{re.escape(suffix)}_\d+$") for suffix in _SOURCE_ID_SUFFIXES
 ]
@@ -141,7 +146,8 @@ def extract_source_id_and_clip_index(filename):
     itself may contain underscores, so this anchors on the known suffix
     tokens rather than naively splitting on the last N underscores (verified
     against the exact naming used by save_qualified_segments /
-    process_single_video_random_worker in the preprocessing script).
+    process_single_video_random_worker / process_single_video_center_worker
+    in the preprocessing script).
 
     extract_source_id() is implemented in terms of this function so the two
     can never disagree about which suffix pattern matched.
@@ -238,13 +244,13 @@ def filter_test_indices_top_clip_only(test_indices, video_files):
     """
     Restricts a test-index list to only the "_1" indexed clip per source
     video, independently per mode (e.g. keeps "<stem>_max_emotion_1" and
-    "<stem>_min_neutral_1" and "<stem>_rnd_1" if all exist for a video, but
+    "<stem>_center_1" and "<stem>_rnd_1" if all exist for a video, but
     drops "_max_emotion_2", "_max_emotion_3", etc.). There is no meaningful
     way to rank "_max_emotion_1" against "_rnd_1" against each other (they
     are scored on different, incomparable criteria -- see
-    process_single_video_max_emotion_worker / _min_neutral_worker / _random_
-    worker in the preprocessing script), so "top clip" is defined per-mode,
-    not as a single global winner per video.
+    score_single_video_max_emotion_worker / process_single_video_center_worker /
+    process_single_video_random_worker in the preprocessing script), so "top
+    clip" is defined per-mode, not as a single global winner per video.
 
     This only ever removes clips from the test set -- it never adds a clip,
     never moves a clip between train/val/test, and never changes which
@@ -530,7 +536,7 @@ def get_args():
             "Downloaded automatically (and cached) if not already present locally."
         ),
     )
-    parser.add_argument("--num_classes", type=int, default=7)
+    parser.add_argument("--num_classes", type=int, default=10)
 
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=64)
@@ -656,7 +662,7 @@ def get_args():
     parser.add_argument(
         "--freeze_epochs",
         type=int,
-        default=0,
+        default=5,
         help="Number of initial epochs where only the classification head is trained "
         "(backbone frozen). 0 disables freezing (full fine-tuning from epoch 1, "
         "matching original behavior). Recommended: 2-5 for small/imbalanced datasets.",
@@ -698,7 +704,7 @@ def get_args():
         action="store_true",
         help="If set, restrict the held-out test set to only the '_1' indexed clip "
         "per source video, independently per mode present (e.g. keep "
-        "<stem>_max_emotion_1 and <stem>_min_neutral_1 and <stem>_rnd_1, but drop "
+        "<stem>_max_emotion_1 and <stem>_center_1 and <stem>_rnd_1, but drop "
         "_max_emotion_2, _max_emotion_3, ...). Train/val are completely unaffected "
         "and still use all K clips per video; this does NOT change which source "
         "videos are assigned to train/val/test -- see filter_test_indices_top_clip_only. "
@@ -1515,7 +1521,7 @@ def main():
     # NOTE: split_seed is intentionally independent of --seed, so the held-out
     # test set stays fixed even if you sweep training seeds for variance runs.
     # Grouped by source video (see extract_source_id) so multiple clips drawn
-    # from the same original video (e.g. via the max_emotion/min_neutral/random
+    # from the same original video (e.g. via the max_emotion/center/random
     # distillation passes with k>1) can never span both the CV pool and the
     # test set -- doing so would let the model partly recognize the subject/
     # scene instead of generalizing, inflating reported metrics.
