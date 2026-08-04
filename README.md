@@ -1,4 +1,5 @@
 # Emotion-Guided Temporal Data Distillation
+[![DOI](https://zenodo.org/badge/1073745175.svg)](https://doi.org/10.5281/zenodo.21793814)
 
 Official PyTorch implementation for **"Emotion-Guided Data Distillation for Spatio-Temporal Feature Learning in Video Transformer-Based Facial Expression Recognition"**.
 
