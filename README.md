@@ -4,7 +4,17 @@ Official PyTorch implementation for **"Emotion-Guided Data Distillation for Spat
 
 This repository provides a modular, end-to-end pipeline for processing raw video datasets, distilling them into high-signal expressive temporal segments using emotion-based salience scoring, and fine-tuning video transformer models for dynamic facial expression recognition (DFER).
 
-The codebase supports preprocessing, face-region extraction, emotion-guided temporal trimming, random baseline trimming, visualization utilities, and offline fine-tuning of video transformer backbones such as **ViViT** and **TimeSformer**.
+## 📖 Table of Contents
+* [Installation & Setup](#-installation--setup)
+* [Codebase Architecture](#️-codebase-architecture)
+* [Data Distillation Pipeline](#️-data-distillation-pipeline)
+  * [1. Face ROI Extraction](#1-face-roi-extraction)
+  * [2. Emotion-Guided Analysis](#2-emotion-guided-framevideo-analysis)
+  * [3. Temporal Distillation & Baselines](#3-temporal-distillation--baselines)
+* [Utilities & Visualization](#-utilities--visualization)
+* [Model Architectures & Training](#-model-architectures--training)
+* [Pretrained Models](#-pretrained-models)
+* [Citation](#-citation)
 
 ---
 
@@ -18,290 +28,182 @@ git clone https://github.com/Roodaki/Temporal-Distillation-DFER.git
 cd Temporal-Distillation-DFER
 
 # Create and activate environment
-conda create -n dfer python=3.9
+conda create -n dfer python=3.9 -y
 conda activate dfer
 
-# Install PyTorch
-# Adjust the CUDA version according to your system if needed
+# Install PyTorch (Adjust the CUDA version according to your system if needed)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
 # Install pipeline dependencies
 pip install -r requirements.txt
 ```
 
----
-
 ## 🗂️ Codebase Architecture
 
-The repository holds the preprocessing, temporal distillation, training, and analysis scripts. Pretrained Hugging Face backbones (e.g. `timesformer-base-finetuned-k400`) and training checkpoints are downloaded/written locally at run time and are not tracked in Git (see `.gitignore`).
+The repository is divided into the core pipeline (`src/`) and analysis tools (`utils/`). Pretrained Hugging Face backbones and training checkpoints are written locally at run time and are not tracked in Git.
 
-```text
+```
+.
+├── src/
+│   ├── model_training/           # Video transformer fine-tuning scripts
+│   │   ├── train_timesformer.py
+│   │   └── train_vivit.py
+│   └── video_preprocessing/      # Pipeline for data extraction & distillation
+│       ├── analyze_videos.py
+│       ├── extract_faces_mediapipe.py
+│       ├── organize_videos.py
+│       ├── rotate_videos.bat
+│       └── trim_videos.py        # Consolidated emotion-guided and random trimming
 ├── utils/
-│   ├── extract_faces_mediapipe.py     # Face detection and ROI extraction using MediaPipe
-│   ├── analyze_videos.py              # Frame/video-level emotion analysis using DeepFace
-│   ├── trim_videos_emotion.py         # Emotion-guided temporal distillation
-│   ├── trim_videos_random.py          # Random temporal trimming baseline
-│   ├── organize_videos.py             # Dataset organization utilities
-│   ├── get_videos_length.py           # Video duration/statistics analysis
-│   ├── draw_emotion_segmentation_figure.py # Visualization of emotion-guided segmentation
-│   ├── timesformer_train_offline.py   # Offline TimeSformer fine-tuning script
-│   └── vivit_train_offline.py         # Offline ViViT fine-tuning script
-│
-├── all.bat                            # Runs the full pipeline end-to-end (Windows)
+│   ├── generate_figures/         # Visualization utilities
+│   │   └── draw_emotion_segmentation_figure.py
+│   └── video_processing/         # Dataset statistics and analysis tools
+│       ├── analyze_class_score_distributions.py
+│       ├── count_clips.py
+│       └── get_videos_length.py
 ├── requirements.txt
-├── .gitignore
+├── LICENSE
 └── README.md
 ```
 
----
-
 ## ⚙️ Data Distillation Pipeline
 
-Naturalistic facial expression datasets often contain long videos with neutral, low-signal, or redundant frames. This repository implements an emotion-guided temporal distillation pipeline that selects the most expressive temporal segments from each video before training.
+Naturalistic facial expression datasets often contain long videos with neutral, low-signal, or redundant frames. This pipeline extracts face ROIs, computes frame-by-frame emotion salience, and distills videos into compact, high-signal clips for training.
 
-The general pipeline is:
+### 1. Face ROI Extraction
 
-```text
-Raw videos
-   ↓
-Face ROI extraction
-   ↓
-Emotion probability analysis
-   ↓
-Temporal salience scoring
-   ↓
-Emotion-guided clip extraction
-   ↓
-Video transformer fine-tuning
-```
-
----
-
-## 1. Face ROI Extraction
-
-Use MediaPipe-based face extraction to crop facial regions and reduce background noise.
+Use MediaPipe to crop facial regions and reduce background noise.
 
 ```bash
-python utils/extract_faces_mediapipe.py \
+python src/video_preprocessing/extract_faces_mediapipe.py \
     --input_dir ./data/raw_videos \
     --output_dir ./data/cropped_faces
 ```
 
-Expected input structure:
+### 2. Emotion-Guided Frame/Video Analysis
 
-```text
-data/
-└── raw_videos/
-    ├── class_1/
-    │   ├── video_001.mp4
-    │   └── video_002.mp4
-    ├── class_2/
-    │   ├── video_003.mp4
-    │   └── video_004.mp4
-    └── ...
-```
-
-Expected output structure:
-
-```text
-data/
-└── cropped_faces/
-    ├── class_1/
-    ├── class_2/
-    └── ...
-```
-
----
-
-## 2. Emotion-Guided Frame/Video Analysis
-
-After extracting face regions, use the emotion analysis script to generate emotion probability logs for each video.
+Generate emotion probability logs (`P_t = <p_t,1, ..., p_t,c>`) for each frame using DeepFace.
 
 ```bash
-python utils/analyze_videos.py \
+python src/video_preprocessing/analyze_videos.py \
     --data_dir ./data/cropped_faces \
     --output ./data/csv_logs
 ```
 
-The analysis stage produces temporal emotion probability vectors of the form:
+### 3. Temporal Distillation & Baselines
 
-```text
-P_t = <p_t,1, p_t,2, ..., p_t,c>
-```
+A single consolidated script handles emotion-guided distillation and baseline extraction (center and random clips). To handle inherently imbalanced DFER datasets, this script also features built-in class balancing strategies (`--balance_mode` and `--k_strategy`) to prevent over-represented classes from dominating the distilled dataset.
 
-where `P_t` represents the predicted emotion distribution at time/frame `t`, and `c` is the number of emotion categories.
-
-These emotion probabilities are used to identify the most expressive temporal windows in each video.
-
----
-
-## 3. Emotion-Guided Temporal Distillation
-
-The emotion-guided trimming script selects high-salience temporal clips based on the emotion probability logs.
-
-For ViViT-style input with 16 frames:
+**Emotion-Guided Distillation (Max-Emotion):**
+Extracts high-salience temporal clips based on emotion probability logs. Candidates are dynamically thresholded against the video's own best window to ensure weak-but-genuine expressions are preserved.
 
 ```bash
-python utils/trim_videos_emotion.py \
+python src/video_preprocessing/trim_videos.py \
+    --mode max_emotion \
     --source_dir ./data/cropped_faces \
     --logs ./data/csv_logs \
-    --output_dir ./data/distilled_clips_emotion \
-    --clip_length 16
+    --output_dir ./data/distilled_clips \
+    --clip_length 16 \
+    --balance_mode global_topk
 ```
 
-For TimeSformer-style input with 8 frames:
+**Generating Baselines (Center & Random):**
+Generate baseline datasets for ablation or comparison. These do not require the emotion CSV logs.
 
 ```bash
-python utils/trim_videos_emotion.py \
+python src/video_preprocessing/trim_videos.py \
+    --mode random \
     --source_dir ./data/cropped_faces \
-    --logs ./data/csv_logs \
-    --output_dir ./data/distilled_clips_emotion \
-    --clip_length 8
+    --output_dir ./data/distilled_clips \
+    --clip_length 16 \
+    --k_strategy auto_balance
 ```
 
-`--source_dir` must point at the same cropped-face videos used as input to `analyze_videos.py` — the CSV logs alone only carry per-frame emotion scores, not the original frames.
+**Run the Full Suite:**
+Passing `--mode both` extracts the emotion-guided dataset and both baselines simultaneously into three separate subdirectories (`max_emotion`, `center_clips`, and `random`).
 
-The goal is to extract compact, emotion-rich clips that preserve the most discriminative temporal information while reducing redundant or neutral frames.
+## 📊 Utilities & Visualization
 
----
-
-## 4. Random Temporal Trimming Baseline
-
-A random trimming baseline is also provided for comparison against the emotion-guided distillation strategy.
+A collection of scripts is provided to manage datasets and visualize the distillation process.
 
 ```bash
-python utils/trim_videos_random.py \
-    --input_dir ./data/cropped_faces \
-    --output_dir ./data/distilled_clips_random \
-    --clip_length 16
+# Visualize emotion-guided temporal segmentation
+python utils/generate_figures/draw_emotion_segmentation_figure.py --root_dir ./data/csv_logs
+
+# Organize flat datasets into class subfolders
+python src/video_preprocessing/organize_videos.py \
+    --source_dir ./data/distilled_clips/max_emotion \
+    --output_dir ./data/distilled_organized
+
+# Dataset analysis tools
+python utils/video_processing/get_videos_length.py --dataset_root ./data/cropped_faces
+python utils/video_processing/count_clips.py --dataset_root ./data/distilled_clips
+python utils/video_processing/analyze_class_score_distributions.py --logs ./data/csv_logs
 ```
-
-For TimeSformer-style input:
-
-```bash
-python utils/trim_videos_random.py \
-    --input_dir ./data/cropped_faces \
-    --output_dir ./data/distilled_clips_random \
-    --clip_length 8
-```
-
-This baseline allows direct comparison between random temporal sampling and emotion-guided temporal selection.
-
----
-
-## 5. Visualization
-
-To visualize emotion-guided temporal segmentation and selected expressive regions, use:
-
-```bash
-python utils/draw_emotion_segmentation_figure.py
-```
-
-This utility can be used to generate figures showing how emotion probability changes over time and which temporal segments are selected by the distillation pipeline. By default it scans `./data/csv_logs` (the output of step 2); pass `--root_dir` to point it elsewhere.
-
----
-
-## 6. Optional Utilities
-
-Two additional scripts are provided outside the core pipeline:
-
-```bash
-# Organize clips whose class is embedded in the filename (e.g. legacy/flat datasets)
-# into per-class subfolders, based on the `_trimmed_<N>` / `_rnd_<N>` naming convention.
-python utils/organize_videos.py \
-    --source_dir ./data/distilled_clips_emotion \
-    --output_dir ./data/distilled_clips_emotion_organized
-
-# Report per-video duration, frame count, FPS, and resolution as a CSV.
-python utils/get_videos_length.py \
-    --dataset_root ./data/cropped_faces \
-    --output_csv ./video_dataset_info.csv
-```
-
----
 
 ## 🧠 Model Architectures & Training
 
-This repository supports transformer-based video models for facial expression recognition.
+This repository supports transformer-based video models for facial expression recognition, specifically TimeSformer and ViViT.
 
-Input tensors are expected to follow the shape:
+The training pipeline has been engineered to handle the unique challenges of naturalistic DFER datasets, specifically severe class imbalance and train/test data leakage.
 
-```text
-[Batch, Channels, Frames, Height, Width]
-```
+### Key Training Features
 
-or:
+- **Strict Anti-Leakage Splitting:** Automatically extracts the original video ID from distilled clips and uses `StratifiedGroupKFold` to guarantee that clips from the same source video never cross train/val/test boundaries.
+- **Advanced Imbalance Handling:** Supports raw inverse weighting, Focal Loss (`--loss_type focal`), batch-level oversampling (`--use_weighted_sampler`), and the Effective Number of Samples weighting scheme (Cui et al., 2019) calibrated for DFER datasets.
+- **Staged Unfreezing:** Prevents catastrophic forgetting and early overfitting by freezing the transformer backbone for the first few epochs (`--freeze_epochs`), forcing the classification head to adapt first.
+- **Robust Evaluation:** Built-in support for k-fold cross-validation (`--n_folds`) to provide defensible mean ± std metrics for minority classes, plus an option to evaluate only the single highest-scoring clip per video (`--test_top_clip_only`).
+- **Train-Time Augmentation:** Configurable temporal jitter, color jitter, and horizontal flipping (`--augment`) to prevent memorization of oversampled minority classes.
 
-```text
-[B, C, T, H, W]
-```
+### Training Examples
 
-depending on the specific model implementation and data loader.
+Both training scripts automatically download the necessary Hugging Face backbones if they are not cached locally.
 
----
-
-## Model Technical Specs
-
-| Architecture | Attention Scheme                   | Input Tensor Shape     | Patch Size      | Pre-training                          |
-| ------------ | ---------------------------------- | ---------------------- | --------------- | ------------------------------------- |
-| TimeSformer  | Divided Space-Time Attention       | `[B, 3, 8, 224, 224]`  | 16 × 16         | ImageNet / Kinetics-style pretraining |
-| ViViT        | Factorised Encoder                 | `[B, 3, 16, 224, 224]` | 16 × 16         | ImageNet / Kinetics-style pretraining |
-
----
-
-## Offline Fine-Tuning
-
-The repository includes offline training scripts for fine-tuning transformer backbones on distilled video clips. Both scripts run fully offline: they load a locally downloaded Hugging Face model directory rather than pulling weights from the Hub at train time.
-
-First, download the pretrained backbone on any internet-connected machine:
+**Standard Fine-Tuning (TimeSformer):**
 
 ```bash
-hf download facebook/timesformer-base-finetuned-k400 --local-dir ./timesformer-base-finetuned-k400
-hf download google/vivit-b-16x2-kinetics400 --local-dir ./vivit-b-16x2-kinetics400
-```
-
-### Train TimeSformer
-
-```bash
-python utils/timesformer_train_offline.py \
-    --data_dir ./data/distilled_clips_emotion \
+python src/model_training/train_timesformer.py \
+    --data_dir ./data/distilled_clips/max_emotion \
     --save_dir ./checkpoints/timesformer \
-    --model_name ./timesformer-base-finetuned-k400
+    --epochs 50 \
+    --batch_size 16 \
+    --freeze_epochs 3
 ```
 
-### Train ViViT
+**Training with Heavy Imbalance & Augmentation (ViViT):**
 
 ```bash
-python utils/vivit_train_offline.py \
-    --data_dir ./data/distilled_clips_emotion \
+python src/model_training/train_vivit.py \
+    --data_dir ./data/distilled_clips/max_emotion \
     --save_dir ./checkpoints/vivit \
-    --model_name ./vivit-b-16x2-kinetics400
+    --class_weight_scheme effective_number \
+    --loss_type focal \
+    --use_weighted_sampler \
+    --augment \
+    --freeze_epochs 5 \
+    --n_folds 5
 ```
 
-Both scripts accept additional flags (`--num_classes`, `--epochs`, `--batch_size`, `--lr_backbone`, `--lr_head`, `--val_split`, `--test_split`, and more) — run either script with `--help` for the full list.
+For a full list of hyperparameters (including custom learning rates for the backbone vs. head, gradient accumulation, and learning rate scheduling), run `python src/model_training/train_timesformer.py --help`.
 
----
+## 📦 Pretrained Models
 
-## Fine-Tuning Configuration
+Checkpoints for all trained models are provided below, organized by dataset, architecture, and distillation strategy.
 
-The default fine-tuning setup (see `--help` on either training script to override):
-
-| Setting                 | Value                              |
-| ----------------------- | ----------------------------------- |
-| Optimizer               | AdamW                              |
-| Learning Rate (backbone)| `2e-5`                             |
-| Learning Rate (head)    | `3e-4`                             |
-| Weight Decay            | `0.01`                             |
-| Scheduler               | Cosine schedule with warmup        |
-| Warmup Ratio            | `0.1`                              |
-| Loss Function           | Cross-Entropy Loss (label smoothing `0.1`) |
-| Batch Size              | 16 (with gradient accumulation over 4 steps) |
-| Early Stopping          | Validation F1-score based          |
-| Early Stopping Patience | 5 epochs                           |
-
-The pretrained backbone and the classification head are trained with separate learning rates (`--lr_backbone` / `--lr_head`), which is a lightweight approximation of discriminative fine-tuning.
-
----
+| Dataset | Architecture | Distillation Strategy | Download |
+|---|---|---|---|
+| **DFEW** | **TimeSformer** | Max-Emotion (proposed) | [Google Drive](https://drive.google.com/file/d/1fUPRBqq1mNY6_6hOg8jUCiuBc_YAjea5/view?usp=drive_link) |
+| | | Center Clips | [Google Drive](https://drive.google.com/file/d/1ShChZJ-wzc5gV3LNvBF2n0EBB0cfAW37/view?usp=drive_link) |
+| | | Random Sampling | [Google Drive](https://drive.google.com/file/d/1PhTzc048ugmDffGirXJW4AwPPGULSPBV/view?usp=drive_link) |
+| | **ViViT** | Max-Emotion (proposed) | [Google Drive](https://drive.google.com/file/d/123MuVwaHfYxzAyJ9LLRMzZkOaPkKYdgx/view?usp=drive_link) |
+| | | Center Clips | [Google Drive](https://drive.google.com/file/d/1QNH8h7ekEs29zd11cq67Kj3iOAdFX6Xu/view?usp=drive_link) |
+| | | Random Sampling | [Google Drive](https://drive.google.com/file/d/1Mnfy0HJpf0pI4f8wOor9lLToLQD19gr1/view?usp=drive_link) |
+| **EMOGNITION** | **TimeSformer** | Max-Emotion (proposed) | [Google Drive](https://drive.google.com/file/d/1MwshzD45fq0ECWfhoIL3yh2KppzOlhFI/view?usp=drive_link) |
+| | | Center Clips | [Google Drive](https://drive.google.com/file/d/12mg0FbBdMLH7fKwvEHzTBOFjb8A1a2Hm/view?usp=drive_link) |
+| | | Random Sampling | [Google Drive](https://drive.google.com/file/d/1hP-s17Zhml_cA76i7O-cTBI-PA9AQj95/view?usp=drive_link) |
+| | **ViViT** | Max-Emotion (proposed) | [Google Drive](https://drive.google.com/file/d/16_k4jWuKSxAFLThImSSyjJvBQJIXOtfL/view?usp=drive_link) |
+| | | Center Clips | [Google Drive](https://drive.google.com/file/d/1ce9GcwKgcDfxBs4dnU4or_Y96IfkgVQf/view?usp=drive_link) |
+| | | Random Sampling | [Google Drive](https://drive.google.com/file/d/1kgn6sSier15GSJ7t8Aywng-zgMtwMqhA/view?usp=drive_link) |
 
 ## 📝 Citation
 
