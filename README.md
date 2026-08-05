@@ -2,11 +2,9 @@
 
 [![DOI](https://zenodo.org/badge/1073745175.svg)](https://doi.org/10.5281/zenodo.21793814)
 
-This repository is the official implementation of [Emotion-Guided Data Distillation for Spatio-Temporal Feature Learning in Video Transformer-Based Facial Expression Recognition](https://arxiv.org/abs/XXXX.XXXXX).
-
->📋 Optional: include a graphic explaining your approach/main result, link to demos, blog posts and tutorials
-
 This repository provides a modular, end-to-end pipeline for processing raw video datasets, distilling them into high-signal expressive temporal segments using emotion-based salience scoring, and fine-tuning video transformer models for dynamic facial expression recognition (DFER).
+
+<img width="637" height="961" alt="image" src="https://github.com/user-attachments/assets/122c092b-f720-48e3-98e5-12d6318925a9" />
 
 ## Requirements
 
@@ -134,8 +132,6 @@ python src/model_trainging/train_vivit.py \
 
 For a full list of hyperparameters (including custom learning rates for the backbone vs. head, gradient accumulation, and learning rate scheduling), run `python src/model_trainging/train_timesformer.py --help`.
 
->📋 Note: this directory is named `src/model_trainging` (not `training`) in the current codebase — the paths above match what's actually on disk.
-
 ## Evaluation
 
 There is no separate evaluation script — evaluation is built into the training scripts. Each script carves out a group-aware held-out test split (`--test_split`, default `0.2`, split via `StratifiedGroupKFold` so clips from the same source video never leak across the split), then evaluates the trained model on it:
@@ -161,12 +157,19 @@ Results are written to `--save_dir`:
 
 >📋 Include a table of results from your paper, and link back to the leaderboard for clarity and context. Quantitative benchmark numbers (accuracy / F1 per dataset) are not yet published here — see the paper for reported results.
 
-### [Dynamic Facial Expression Recognition on \<dataset\>](https://paperswithcode.com/)
+### In-The-Lab "Emognition" Dataset
 
-| Model name  | Top 1 Accuracy | F1-Score |
-| ----------- | -------------- | -------- |
-| TimeSformer |       -        |    -     |
-| ViViT       |       -        |    -     |
+| Model Name | Top-1 Accuracy | F1-Score | UAR | WAR |
+|------------|----------------|----------|-----|-----|
+| ViViT | 82.92% | 83.11% | 81.59% | 82.92% |
+| TimeSformer | 81.54% | 80.86% | 78.99% | 81.54% |
+
+### In-The-Wild "DFEW" Dataset
+
+| Model Name | Top-1 Accuracy | F1-Score | UAR | WAR |
+|------------|----------------|----------|-----|-----|
+| ViViT | 90.93% | 81.31% | 77.32% | 90.93% |
+| TimeSformer | 89.51% | 77.69% | 74.66% | 89.51% |
 
 ### Pretrained Models
 
