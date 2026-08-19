@@ -155,8 +155,6 @@ Results are written to `--save_dir`:
 
 ## Results
 
->📋 Include a table of results from your paper, and link back to the leaderboard for clarity and context. Quantitative benchmark numbers (accuracy / F1 per dataset) are not yet published here — see the paper for reported results.
-
 ### In-The-Lab "Emognition" Dataset
 
 | Model Name | Top-1 Accuracy | F1-Score | UAR | WAR |
