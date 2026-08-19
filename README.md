@@ -111,7 +111,7 @@ The training pipeline is engineered to handle the unique challenges of naturalis
 
 ```train
 # Standard fine-tuning (TimeSformer)
-python src/model_trainging/train_timesformer.py \
+python src/model_training/train_timesformer.py \
     --data_dir ./data/distilled_clips/max_emotion \
     --save_dir ./checkpoints/timesformer \
     --epochs 50 \
@@ -119,7 +119,7 @@ python src/model_trainging/train_timesformer.py \
     --freeze_epochs 3
 
 # Training with heavy imbalance & augmentation (ViViT)
-python src/model_trainging/train_vivit.py \
+python src/model_training/train_vivit.py \
     --data_dir ./data/distilled_clips/max_emotion \
     --save_dir ./checkpoints/vivit \
     --class_weight_scheme effective_number \
@@ -130,14 +130,14 @@ python src/model_trainging/train_vivit.py \
     --n_folds 5
 ```
 
-For a full list of hyperparameters (including custom learning rates for the backbone vs. head, gradient accumulation, and learning rate scheduling), run `python src/model_trainging/train_timesformer.py --help`.
+For a full list of hyperparameters (including custom learning rates for the backbone vs. head, gradient accumulation, and learning rate scheduling), run `python src/model_training/train_timesformer.py --help`.
 
 ## Evaluation
 
 There is no separate evaluation script — evaluation is built into the training scripts. Each script carves out a group-aware held-out test split (`--test_split`, default `0.2`, split via `StratifiedGroupKFold` so clips from the same source video never leak across the split), then evaluates the trained model on it:
 
 ```eval
-python src/model_trainging/train_timesformer.py \
+python src/model_training/train_timesformer.py \
     --data_dir ./data/distilled_clips/max_emotion \
     --save_dir ./checkpoints/timesformer \
     --test_split 0.2 \
@@ -197,7 +197,7 @@ The repository is divided into the core pipeline (`src/`) and analysis tools (`u
 ```text
 .
 ├── src/
-│   ├── model_trainging/           # Video transformer fine-tuning scripts
+│   ├── model_training/            # Video transformer fine-tuning scripts
 │   │   ├── train_timesformer.py
 │   │   ├── train_timesformer_leakage.py
 │   │   ├── train_vivit.py
