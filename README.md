@@ -4,7 +4,7 @@
 
 This repository provides a modular, end-to-end pipeline for processing raw video datasets, distilling them into high-signal expressive temporal segments using emotion-based salience scoring, and fine-tuning video transformer models for dynamic facial expression recognition (DFER).
 
-<img width="720" height="1133" alt="shematic" src="https://github.com/user-attachments/assets/9a8d071a-021e-4bc7-a022-ef815dae5216" />
+<img width="720" height="1133" alt="shematic" src="https://github.com/user-attachments/assets/b6d30110-6804-4b31-afef-c61b066d6c4b" />
 
 ## Requirements
 
