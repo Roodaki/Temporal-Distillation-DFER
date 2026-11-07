@@ -1,16 +1,23 @@
+"""
+Face ROI isolation with a Multitask Cascaded Convolutional Network (MTCNN).
+
+For every frame, MTCNN locates the face; the highest-confidence detection's
+bounding box (plus a small margin) is cropped and resized, removing background
+so downstream models only see the facial region. Frames without a detected
+face are dropped.
+"""
+
 import argparse
 import os
 from typing import Optional
 import cv2
 from glob import glob
-import mediapipe as mp
 import multiprocessing
 from multiprocessing import Pool
 import time
 
 PARAMS = {
-    "detection_confidence": 0.5,
-    "model_selection": 0,
+    "detection_confidence": 0.9,
     "output_size": (224, 224),
     "padding_ratio": 0.1,
     "codec": "mp4v",
@@ -90,11 +97,23 @@ def process_single_video(args: tuple) -> dict:
         return {"status": "error", "file": input_filename, "error": str(e)}
 
 
+_DETECTOR = None
+
+
+def _get_detector():
+    """One MTCNN instance per worker process (lazy: TensorFlow is heavy)."""
+    global _DETECTOR
+    if _DETECTOR is None:
+        from mtcnn import MTCNN
+
+        _DETECTOR = MTCNN()
+    return _DETECTOR
+
+
 def detect_and_crop_face(
     input_video_path: str,
     output_video_path: str,
-    detection_confidence: float = 0.5,
-    model_selection: int = 0,
+    detection_confidence: float = 0.9,
     output_size: tuple = (224, 224),
     padding_ratio: float = 0.1,
     codec: str = "mp4v",
@@ -103,10 +122,7 @@ def detect_and_crop_face(
     skip_missing_faces: bool = True,
 ) -> int:
     """Returns the number of frames successfully written."""
-    mp_face_detection = mp.solutions.face_detection
-    face_detection = mp_face_detection.FaceDetection(
-        model_selection=model_selection, min_detection_confidence=detection_confidence
-    )
+    detector = _get_detector()
 
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
@@ -130,16 +146,16 @@ def detect_and_crop_face(
             if not ret:
                 break
 
-            results = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            detections = [
+                d
+                for d in detector.detect_faces(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                if d.get("confidence", 0.0) >= detection_confidence
+            ]
 
-            if results.detections:
-                bbox = results.detections[0].location_data.relative_bounding_box
+            if detections:
+                best = max(detections, key=lambda d: d["confidence"])
+                x, y, w, h = (int(v) for v in best["box"])
                 ih, iw = frame.shape[:2]
-
-                x = int(bbox.xmin * iw)
-                y = int(bbox.ymin * ih)
-                w = int(bbox.width * iw)
-                h = int(bbox.height * ih)
 
                 pad_x = int(w * padding_ratio)
                 pad_y = int(h * padding_ratio)
@@ -163,13 +179,12 @@ def detect_and_crop_face(
     finally:
         cap.release()
         out.release()
-        face_detection.close()
 
     return frames_written
 
 
 def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MediaPipe face ROI extraction")
+    parser = argparse.ArgumentParser(description="MTCNN face ROI extraction")
     parser.add_argument(
         "--input_dir",
         type=str,
@@ -182,6 +197,18 @@ def get_args() -> argparse.Namespace:
         default="./data/cropped_faces",
         help="Where cropped-face videos are written, mirroring the class structure.",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=min(4, multiprocessing.cpu_count()),
+        help="Parallel worker processes (each loads its own MTCNN model).",
+    )
+    parser.add_argument(
+        "--detection_confidence",
+        type=float,
+        default=PARAMS["detection_confidence"],
+        help="Minimum MTCNN face confidence (default: %(default)s).",
+    )
     return parser.parse_args()
 
 
@@ -191,16 +218,16 @@ if __name__ == "__main__":
     args = get_args()
     INPUT_DIR = args.input_dir
     OUTPUT_DIR = args.output_dir
+    PARAMS["detection_confidence"] = args.detection_confidence
 
     print(f"Scanning: {INPUT_DIR}")
     tasks = collect_tasks(INPUT_DIR, OUTPUT_DIR)
     total = len(tasks)
     print(f"\nTotal videos to process: {total}")
 
-    # Use all cores — Pool with imap_unordered gives the best dynamic scheduling:
-    # as soon as any worker finishes a video it immediately picks up the next one,
-    # no worker ever sits idle while tasks remain in the queue.
-    num_workers = multiprocessing.cpu_count()
+    # Pool with imap_unordered gives dynamic scheduling: as soon as a worker
+    # finishes a video it picks up the next one.
+    num_workers = args.num_workers
     print(f"Using {num_workers} workers\n")
 
     done, ok, skipped, no_face, failed = 0, 0, 0, 0, 0

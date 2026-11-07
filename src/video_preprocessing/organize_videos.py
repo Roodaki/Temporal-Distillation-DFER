@@ -11,8 +11,8 @@ def organize_videos_by_class(source_directory, destination_root_directory):
     within a specified destination root directory.
 
     Handles filenames in formats:
-      1. <original_stem>_trimmed_<number>.mp4
-      2. <original_stem>_rnd_<number>.mp4  (The new random sampling format)
+      <original_stem>_<mode>_<number>.mp4, with <mode> one of
+      max_emotion, test, center, rnd (or the legacy "trimmed").
 
     Args:
         source_directory (str): The path to the directory containing the video files.
@@ -30,10 +30,12 @@ def organize_videos_by_class(source_directory, destination_root_directory):
         return
 
     # --- REGEX UPDATE ---
-    # This pattern now looks for either "_trimmed_" OR "_rnd_" followed by digits
+    # Matches any distilled-clip suffix followed by digits
     # Group 1: The original stem (everything before the suffix)
     # Group 2: The extension (e.g., .mp4, .avi)
-    filename_pattern = re.compile(r"^(.*?)_(?:trimmed|rnd)_\d+(\.\w+)$", re.IGNORECASE)
+    filename_pattern = re.compile(
+        r"^(.*?)_(?:trimmed|rnd|max_emotion|center|test)_\d+(\.\w+)$", re.IGNORECASE
+    )
 
     files_processed_count = 0
 

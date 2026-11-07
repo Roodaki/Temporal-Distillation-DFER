@@ -1,6 +1,9 @@
 @echo off
 SETLOCAL ENABLEDELAYEDEXPANSION
 
+REM Geometric normalization: rotates every MP4 90 degrees clockwise
+REM (ffmpeg transpose=1) to correct the recording orientation.
+
 REM Directory containing the MP4 files
 REM If the script is in the same directory as the videos, you can use:
 REM SET "TARGET_DIR=."
@@ -32,7 +35,7 @@ FOR %%F IN ("%TARGET_DIR%\*.mp4") DO (
     IF EXIST "!OUTPUT_FILE!" (
         echo Output file !OUTPUT_FILE! already exists. Skipping !FILENAME!.
     ) ELSE (
-        ffmpeg -i "%%F" -vf "transpose=2" -c:a copy "!OUTPUT_FILE!"
+        ffmpeg -i "%%F" -vf "transpose=1" -c:a copy "!OUTPUT_FILE!"
         IF !ERRORLEVEL! EQU 0 (
             echo Successfully rotated !FILENAME! to !OUTPUT_FILE!
             REM --- ADDITION FOR DELETION ---
