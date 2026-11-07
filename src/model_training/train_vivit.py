@@ -17,8 +17,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, Subset, WeightedRandomSampler
 from torch.utils.data.dataloader import default_collate
-import matplotlib.pyplot as plt
-import seaborn as sns
 from collections import Counter
 
 from transformers import (
@@ -31,15 +29,11 @@ from transformers import (
 
 hf_logging.set_verbosity_error()
 
-from sklearn.model_selection import train_test_split, StratifiedGroupKFold
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    confusion_matrix,
-    classification_report,
-)
+from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 from datetime import datetime
+
+import evaluation_protocol as protocol
 
 try:
     from decord import VideoReader, cpu
@@ -110,162 +104,8 @@ def filter_none_collate(batch):
     return default_collate(batch)
 
 
-# ---------------------------------------------------------------------------
-# Source-video grouping (prevents train/val/test leakage across clips drawn
-# from the same source video)
-# ---------------------------------------------------------------------------
-# The distillation preprocessing script (max_emotion / center_clips / random
-# passes) can emit multiple non-overlapping clips per source video, named
-# "<video_stem>_<mode>_<index>.mp4" e.g. "00123_max_emotion_1.mp4",
-# "00123_max_emotion_2.mp4", "00123_center_3.mp4", "00123_rnd_2.mp4". Clips
-# sharing a video_stem come from the same subject / recording session /
-# emotional episode, so a label-only stratified split (the original
-# behavior) can put clip 1 of a video in train and clip 2 of the *same*
-# video in test -- letting the model partly "recognize" the subject/scene
-# rather than generalizing, which inflates reported metrics.
-# _SOURCE_ID_SUFFIXES lists every mode suffix the preprocessing script can
-# produce; extend this list if new modes are added.
-#
-# NOTE: "min_neutral" was removed and "center" (center_clips pass) added to
-# match the updated preprocessing script (min-neutral scoring was dropped in
-# favor of a fixed, per-video closest-to-midpoint "center" strategy).
-_SOURCE_ID_SUFFIXES = ["max_emotion", "center", "rnd"]
-_SOURCE_ID_PATTERNS = [
-    re.compile(rf"^(.*)_{re.escape(suffix)}_\d+$") for suffix in _SOURCE_ID_SUFFIXES
-]
-_SOURCE_ID_AND_INDEX_PATTERNS = [
-    re.compile(rf"^(.*)_{re.escape(suffix)}_(\d+)$") for suffix in _SOURCE_ID_SUFFIXES
-]
-
-
-def extract_source_id_and_clip_index(filename):
-    """
-    Extracts both the original source-video stem AND the trailing per-mode
-    clip index (the integer after the mode suffix, e.g. 2 for
-    "..._max_emotion_2.mp4") from a distilled clip filename. video_stem
-    itself may contain underscores, so this anchors on the known suffix
-    tokens rather than naively splitting on the last N underscores (verified
-    against the exact naming used by save_qualified_segments /
-    process_single_video_random_worker / process_single_video_center_worker
-    in the preprocessing script).
-
-    extract_source_id() is implemented in terms of this function so the two
-    can never disagree about which suffix pattern matched.
-
-    Raises ValueError if no known suffix pattern matches, rather than
-    silently falling back to treating the clip as its own singleton group --
-    a silent fallback could quietly reintroduce leakage (a source video with
-    an unrecognized naming convention would never be grouped with its
-    siblings) without any visible signal that something is wrong. If you add
-    a new preprocessing mode, add its suffix to _SOURCE_ID_SUFFIXES first.
-    """
-    stem = os.path.splitext(os.path.basename(filename))[0]
-    for pattern in _SOURCE_ID_AND_INDEX_PATTERNS:
-        m = pattern.match(stem)
-        if m:
-            return m.group(1), int(m.group(2))
-    raise ValueError(
-        f"extract_source_id_and_clip_index: filename '{filename}' (stem '{stem}') does not "
-        f"match any known suffix pattern {_SOURCE_ID_SUFFIXES}. Refusing to silently treat "
-        f"this as an ungrouped singleton, since that could reintroduce train/val/test leakage "
-        f"for this source video. Add its suffix convention to _SOURCE_ID_SUFFIXES if this is "
-        f"a legitimate new preprocessing mode."
-    )
-
-
-def extract_source_id(filename):
-    """
-    Extracts the original source-video stem from a distilled clip filename by
-    stripping the known trailing "_<mode>_<index>" suffix. See
-    extract_source_id_and_clip_index for the full explanation; this is a
-    thin wrapper that discards the clip index.
-    """
-    source_id, _clip_index = extract_source_id_and_clip_index(filename)
-    return source_id
-
-
-def build_source_groups(video_files):
-    """
-    Returns an array of source-video group IDs, one per entry in
-    `video_files` (a list of (path, label) tuples, in the same order as
-    dataset indices), for use with StratifiedGroupKFold / group-aware splits.
-    """
-    return np.array([extract_source_id(path) for path, _ in video_files])
-
-
-def assert_no_group_leakage(indices_a, indices_b, groups, label_a="split A", label_b="split B"):
-    """
-    Hard, loud sanity check: raises AssertionError immediately if any source
-    -video group ID appears in both `indices_a` and `indices_b`. `groups`
-    must be indexable by the *global* indices contained in indices_a/indices_b
-    (i.e. the full-dataset groups array, not a pre-sliced one). Call this
-    after every grouped_stratified_split -- it's cheap (set intersection) and
-    turns a silent leakage regression into an immediate, unmissable failure
-    rather than an inflated metric discovered much later.
-    """
-    groups_a = set(groups[i] for i in indices_a)
-    groups_b = set(groups[i] for i in indices_b)
-    overlap = groups_a & groups_b
-    assert not overlap, (
-        f"LEAKAGE DETECTED between {label_a} and {label_b}: {len(overlap)} source-video "
-        f"group(s) appear in both splits (e.g. {sorted(overlap)[:5]}...). This means clips "
-        f"from the same source video ended up on both sides of the split, which will "
-        f"inflate reported metrics. This should be impossible after grouped_stratified_split "
-        f"-- if you see this, check that `groups` passed to assert_no_group_leakage matches "
-        f"the same indexing used to build the split."
-    )
-
-
-def grouped_stratified_split(indices, labels, groups, test_size, random_state, n_splits=5):
-    """
-    Splits `indices` into two groups, stratified by `labels` and respecting
-    `groups` (no group ID appears in both halves) -- replaces plain
-    train_test_split wherever multiple clips can share a source video.
-
-    Implemented via StratifiedGroupKFold: request enough folds that one fold
-    is approximately `test_size` of the data, then use that single fold as
-    the held-out half. This still gives a single deterministic split (not
-    full k-fold CV) when called with the default n_splits=5 for a ~20% split;
-    pass a different n_splits if you need a different split fraction (e.g.
-    n_splits=4 for a 25% split). random_state controls which fold is treated
-    as "first" via the shuffle, so it plays the same role as in
-    train_test_split.
-    """
-    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    indices = np.asarray(indices)
-    labels = np.asarray(labels)
-    train_relative_idx, test_relative_idx = next(
-        sgkf.split(indices, labels, groups=groups)
-    )
-    return indices[train_relative_idx].tolist(), indices[test_relative_idx].tolist()
-
-
-def filter_test_indices_top_clip_only(test_indices, video_files):
-    """
-    Restricts a test-index list to only the "_1" indexed clip per source
-    video, independently per mode (e.g. keeps "<stem>_max_emotion_1" and
-    "<stem>_center_1" and "<stem>_rnd_1" if all exist for a video, but
-    drops "_max_emotion_2", "_max_emotion_3", etc.). There is no meaningful
-    way to rank "_max_emotion_1" against "_rnd_1" against each other (they
-    are scored on different, incomparable criteria -- see
-    score_single_video_max_emotion_worker / process_single_video_center_worker /
-    process_single_video_random_worker in the preprocessing script), so "top
-    clip" is defined per-mode, not as a single global winner per video.
-
-    This only ever removes clips from the test set -- it never adds a clip,
-    never moves a clip between train/val/test, and never changes which
-    source videos are considered test videos. Because it operates on a
-    subset of an already group-disjoint split, it cannot reintroduce
-    train/val/test leakage (removing elements from one side of a disjoint
-    partition can't create overlap with the other side).
-    """
-    filtered = []
-    for idx in test_indices:
-        path, _label = video_files[idx]
-        _source_id, clip_index = extract_source_id_and_clip_index(path)
-        if clip_index == 1:
-            filtered.append(idx)
-    return filtered
+# Cross-validation folds, train/val/test partitioning and test-set evaluation
+# live in evaluation_protocol.py (shared by both training scripts).
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +344,7 @@ def load_vivit(model_name, num_classes=None):
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description="ViViT 80-20 Split Training")
+    parser = argparse.ArgumentParser(description="ViViT fine-tuning with cross-validated evaluation")
 
     parser.add_argument(
         "--data_dir",
@@ -519,13 +359,6 @@ def get_args():
         help="Directory to write model checkpoints to.",
     )
 
-    parser.add_argument(
-        "--val_split",
-        type=float,
-        default=0.2,
-        help="Fraction of training pool used for validation (default: 0.2)",
-    )
-    parser.add_argument("--test_split", type=float, default=0.2)
 
     parser.add_argument(
         "--model_name",
@@ -538,39 +371,38 @@ def get_args():
     )
     parser.add_argument("--num_classes", type=int, default=10)
 
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--grad_accum_steps", type=int, default=4)
-    parser.add_argument("--lr_backbone", type=float, default=2e-5)
-    parser.add_argument("--lr_head", type=float, default=3e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.02)
-    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--epochs", type=int, default=300, help="Maximum epochs.")
+    parser.add_argument("--batch_size", type=int, default=8, help="8 for Emognition, 4 for DFEW.")
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument("--lr_backbone", type=float, default=5e-5)
+    parser.add_argument("--lr_head", type=float, default=5e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument(
         "--warmup_ratio",
         type=float,
-        default=0.1,
+        default=0.0,
         help="Fraction of an assumed full run used for linear LR warmup before "
         "handing control to the plateau-based scheduler.",
     )
-    parser.add_argument("--patience", type=int, default=10, help="Early-stopping patience (epochs).")
+    parser.add_argument("--patience", type=int, default=15, help="Early-stopping patience (epochs without val-F1 improvement).")
+    parser.add_argument(
+        "--min_delta",
+        type=float,
+        default=0.001,
+        help="Minimum val-F1 increase that counts as an improvement for early stopping.",
+    )
 
     parser.add_argument(
         "--lr_patience",
         type=int,
-        default=4,
-        help="Epochs of no val-F1 improvement before ReduceLROnPlateau cuts the LR.",
+        default=3,
+        help="Epochs of no val-loss improvement before ReduceLROnPlateau cuts the LR.",
     )
-    parser.add_argument("--lr_factor", type=float, default=0.3, help="Multiplicative LR reduction factor on plateau.")
+    parser.add_argument("--lr_factor", type=float, default=0.1, help="Multiplicative LR reduction factor on plateau.")
     parser.add_argument("--min_lr", type=float, default=1e-7, help="Floor for ReduceLROnPlateau.")
 
     parser.add_argument("--seed", type=int, default=42, help="Seed for model init / training stochasticity.")
-    parser.add_argument(
-        "--split_seed",
-        type=int,
-        default=1337,
-        help="Fixed seed for the train/test carve-out, independent of --seed, "
-        "so the held-out test set doesn't move when you sweep training seeds.",
-    )
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--force_rescan", action="store_true")
 
@@ -618,7 +450,7 @@ def get_args():
     parser.add_argument(
         "--loss_type",
         type=str,
-        default="ce",
+        default="focal",
         choices=["ce", "focal"],
         help="'ce' = (optionally class-weighted) cross-entropy. 'focal' = focal loss "
         "(Lin et al. 2017), optionally combined with class weights for a "
@@ -687,30 +519,9 @@ def get_args():
     )
     parser.add_argument("--no_compile", dest="use_compile", action="store_false")
 
-    # --- Cross-validation ------------------------------------------------
-    parser.add_argument(
-        "--n_folds",
-        type=int,
-        default=1,
-        help="If > 1, runs stratified k-fold CV over the CV pool instead of a single "
-        "80/20 split, and reports mean +/- std per-class metrics across folds. "
-        "Recommended for small classes (e.g. ~39 samples) where a single split "
-        "gives a high-variance, less defensible estimate.",
-    )
 
-    # --- Test-set clip thinning -------------------------------------------
-    parser.add_argument(
-        "--test_top_clip_only",
-        action="store_true",
-        help="If set, restrict the held-out test set to only the '_1' indexed clip "
-        "per source video, independently per mode present (e.g. keep "
-        "<stem>_max_emotion_1 and <stem>_center_1 and <stem>_rnd_1, but drop "
-        "_max_emotion_2, _max_emotion_3, ...). Train/val are completely unaffected "
-        "and still use all K clips per video; this does NOT change which source "
-        "videos are assigned to train/val/test -- see filter_test_indices_top_clip_only. "
-        "Default: off (original behavior -- all clips from test videos are used).",
-    )
 
+    protocol.add_protocol_args(parser)
     return parser.parse_args()
 
 
@@ -985,7 +796,7 @@ def train_epoch(
     LR schedule: while `global_step < warmup_steps`, the warmup scheduler ramps
     LR linearly from 0 -> base LR on each optimizer step. Once warmup completes,
     this function stops touching the LR at all; a ReduceLROnPlateau scheduler
-    (stepped once per epoch on val F1, in run_train) takes over from there. This
+    (stepped once per epoch on val loss, in run_train) takes over from there. This
     avoids the old cosine schedule's core problem: it was sized against
     `args.epochs`, but early stopping usually cuts training short, so the LR
     never actually reached its intended minimum.
@@ -1103,111 +914,15 @@ def validate(model, loader, criterion, device):
     )
 
 
-def save_test_results(model, loader, device, label_map, save_dir, suffix=""):
-    print("\nRunning predictions on Held-out Test Set...")
-    model.eval()
-    preds_list, labels_list = [], []
-    device_type = device.type
-    use_amp = device_type == "cuda"
-
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Test Eval"):
-            if batch is None:
-                continue
-            pixel_values = batch["pixel_values"].to(device, non_blocking=True)
-            labels = batch["labels"].to(device, non_blocking=True)
-
-            with torch.amp.autocast(device_type, enabled=use_amp):
-                outputs = model(pixel_values).logits
-
-            _, preds = torch.max(outputs, 1)
-            preds_list.append(preds.cpu())  # tensor accumulation
-            labels_list.append(labels.cpu())
-
-    preds_all = torch.cat(preds_list).numpy()
-    labels_all = torch.cat(labels_list).numpy()
-
-    acc = accuracy_score(labels_all, preds_all)
-    f1 = f1_score(labels_all, preds_all, average="weighted")
-    macro_f1 = f1_score(labels_all, preds_all, average="macro")
-    print(f"HELD-OUT TEST RESULT -> Acc: {acc:.4f} | Weighted F1: {f1:.4f} | Macro F1: {macro_f1:.4f}")
-
-    class_names = [k for k, v in sorted(label_map.items(), key=lambda item: item[1])]
-    report_dict = classification_report(
-        labels_all, preds_all, target_names=class_names, output_dict=True
+def run_train(args, full_dataset, table, train_indices_full, device, fold_id=1):
+    """Train on one fold's training pool. A group-disjoint subset of the pool
+    (by subject or source video, see --group_by) is held out for validation,
+    which drives early stopping and LR scheduling."""
+    actual_train_idx, actual_val_idx = protocol.grouped_validation_split(
+        table, train_indices_full, args.val_split, seed=args.seed
     )
-
-    csv_path = os.path.join(save_dir, f"final_class_performance{suffix}.csv")
-    print(f"Saving class-wise metrics to: {csv_path}")
-
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Class Name", "Precision", "Recall", "F1-Score", "Support"])
-
-        for class_name, metrics in report_dict.items():
-            if class_name == "accuracy":
-                writer.writerow(
-                    ["TOTAL ACCURACY", "", "", f"{metrics:.4f}", len(labels_all)]
-                )
-                continue
-
-            writer.writerow(
-                [
-                    class_name,
-                    f"{metrics['precision']:.4f}",
-                    f"{metrics['recall']:.4f}",
-                    f"{metrics['f1-score']:.4f}",
-                    metrics["support"],
-                ]
-            )
-
-    cm = confusion_matrix(labels_all, preds_all, normalize="true")
-
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt=".1%",
-        cmap="Blues",
-        xticklabels=class_names,
-        yticklabels=class_names,
-    )
-    plt.xlabel("Predicted Label")
-    plt.ylabel("True Label")
-    plt.title(f"Test Confusion Matrix (Normalized)\nAcc: {acc:.4f}, Weighted F1: {f1:.4f}, Macro F1: {macro_f1:.4f}")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"test_confusion_matrix{suffix}.png"))
-    plt.close()
-
-    return report_dict, acc, f1, macro_f1
-
-
-def run_train(args, full_dataset, train_indices_full, device, fold_id=1):
-    """Single stratified train/val split (optionally one fold of a larger k-fold CV loop),
-    grouped by source video so clips from the same original video never span
-    both train and val (see grouped_stratified_split / extract_source_id)."""
-    cv_labels = [full_dataset.video_files[i][1] for i in train_indices_full]
-    # Full-dataset-length lookup (indexable by the global indices that
-    # grouped_stratified_split returns), not positionally indexed over
-    # train_indices_full -- this must match how assert_no_group_leakage
-    # looks up group IDs below.
-    full_groups = build_source_groups(full_dataset.video_files)
-    cv_groups = full_groups[train_indices_full]
-
-    # n_splits derived from val_split so the held-out fold approximates the
-    # requested fraction (e.g. val_split=0.2 -> n_splits=5 -> ~20% held out).
-    val_n_splits = max(2, round(1.0 / args.val_split))
-    actual_train_idx, actual_val_idx = grouped_stratified_split(
-        train_indices_full,
-        cv_labels,
-        cv_groups,
-        test_size=args.val_split,
-        random_state=args.seed,
-        n_splits=val_n_splits,
-    )
-    assert_no_group_leakage(
-        actual_train_idx, actual_val_idx, full_groups, label_a="train", label_b="val"
+    protocol.assert_disjoint(
+        actual_train_idx, actual_val_idx, table.groups, label_a="train", label_b="val"
     )
 
     print(f"\n[Fold {fold_id}] Split -> Train: {len(actual_train_idx)} | Val: {len(actual_val_idx)}")
@@ -1300,7 +1015,7 @@ def run_train(args, full_dataset, train_indices_full, device, fold_id=1):
     warmup_scheduler = get_constant_schedule_with_warmup(optimizer, warmup_steps)
     plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="max",
+        mode="min",
         factor=args.lr_factor,
         patience=args.lr_patience,
         min_lr=args.min_lr,
@@ -1312,14 +1027,18 @@ def run_train(args, full_dataset, train_indices_full, device, fold_id=1):
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(args.save_dir, f"vivit_train_log_fold{fold_id}_{timestamp}.csv")
-    best_val_f1 = 0.0
+    best_val_f1 = float("-inf")  # first epoch always yields a checkpoint
     patience_counter = 0
     global_step = 0
     start_epoch = 0
     best_model_path = os.path.join(args.save_dir, f"best_model_fold{fold_id}.pth")
     last_checkpoint_path = os.path.join(args.save_dir, f"last_checkpoint_fold{fold_id}.pth")
 
-    if args.resume_from and os.path.exists(args.resume_from):
+    if (
+        args.resume_from
+        and os.path.exists(args.resume_from)
+        and resume_fold_of(args.resume_from) == fold_id
+    ):
         print(f"Resuming from checkpoint: {args.resume_from}")
         ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -1365,9 +1084,9 @@ def run_train(args, full_dataset, train_indices_full, device, fold_id=1):
                 f"(corrupt/unreadable videos) -- check data integrity."
             )
 
-        # Once warmup is complete, let val F1 drive further LR reductions.
+        # Once warmup is complete, let val loss drive further LR reductions.
         if global_step >= warmup_steps:
-            plateau_scheduler.step(v_f1)
+            plateau_scheduler.step(v_loss)
 
         is_frozen = args.freeze_epochs > 0 and epoch < args.freeze_epochs
         print(
@@ -1396,7 +1115,7 @@ def run_train(args, full_dataset, train_indices_full, device, fold_id=1):
 
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
-        if v_f1 > best_val_f1:
+        if v_f1 > best_val_f1 + args.min_delta:
             best_val_f1 = v_f1
             patience_counter = 0
             atomic_save(raw_model.state_dict(), best_model_path)
@@ -1444,38 +1163,34 @@ def run_train(args, full_dataset, train_indices_full, device, fold_id=1):
     return {"acc": final_acc, "f1": final_f1}, best_model_path
 
 
-def summarize_cv_results(fold_reports, save_dir):
-    """
-    Aggregates per-class metrics across folds as mean +/- std, and writes a
-    CSV. This is what makes a volatile small-class number (e.g. disgust,
-    n~39) defensible: a single split's F1 is a high-variance point estimate,
-    but "0.15 +/- 0.09 across 5 folds" tells the reader how much to trust it.
-    """
-    class_names = sorted(
-        {c for report in fold_reports for c in report.keys() if c not in ("accuracy", "macro avg", "weighted avg")}
-    )
-    rows = []
-    for cls in class_names:
-        precisions = [r[cls]["precision"] for r in fold_reports if cls in r]
-        recalls = [r[cls]["recall"] for r in fold_reports if cls in r]
-        f1s = [r[cls]["f1-score"] for r in fold_reports if cls in r]
-        supports = [r[cls]["support"] for r in fold_reports if cls in r]
-        rows.append(
-            [
-                cls,
-                f"{np.mean(precisions):.4f} ± {np.std(precisions):.4f}",
-                f"{np.mean(recalls):.4f} ± {np.std(recalls):.4f}",
-                f"{np.mean(f1s):.4f} ± {np.std(f1s):.4f}",
-                f"{np.mean(supports):.1f}",
-            ]
-        )
+def resume_fold_of(checkpoint_path):
+    """Fold id encoded in a last_checkpoint_fold<k>.pth file name (1 if absent)."""
+    m = re.search(r"fold(\d+)", os.path.basename(checkpoint_path or ""))
+    return int(m.group(1)) if m else 1
 
-    csv_path = os.path.join(save_dir, "cv_class_performance_summary.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+
+def save_fold_predictions(path, dataset, test_indices, labels, preds):
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["Class Name", "Precision (mean ± std)", "Recall (mean ± std)", "F1 (mean ± std)", "Mean Support"])
-        writer.writerows(rows)
-    print(f"\nSaved cross-fold class-performance summary to: {csv_path}")
+        writer.writerow(["clip", "label", "pred"])
+        # filter_none_collate may drop unreadable clips, so paths are only
+        # recorded when every test clip produced a prediction.
+        paths = (
+            [dataset.video_files[i][0] for i in test_indices]
+            if len(test_indices) == len(labels)
+            else [""] * len(labels)
+        )
+        for p, y, yhat in zip(paths, labels, preds):
+            writer.writerow([p, int(y), int(yhat)])
+
+
+def load_fold_predictions(path):
+    labels, preds = [], []
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            labels.append(int(row["label"]))
+            preds.append(int(row["pred"]))
+    return np.array(labels, dtype=int), np.array(preds, dtype=int)
 
 
 def main():
@@ -1485,11 +1200,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(
-        f"--- ViViT Training ---\nModel: {args.model_name}\nVal Split: {args.val_split}\n"
+        f"--- ViViT Training ---\nModel: {args.model_name}\n"
+        f"Folds: {args.fold_file or args.n_folds} | Group by: {args.group_by} | "
+        f"Val split: {args.val_split}\n"
         f"Class weight scheme: {args.class_weight_scheme}\nLoss: {args.loss_type}\n"
         f"Weighted sampler: {args.use_weighted_sampler}\nAugmentation: {args.augment}\n"
-        f"Freeze epochs: {args.freeze_epochs}\ntorch.compile: {args.use_compile}\n"
-        f"Folds: {args.n_folds}\nTest top-clip-only: {args.test_top_clip_only}\nDevice: {device}"
+        f"Freeze epochs: {args.freeze_epochs}\nDevice: {device}"
     )
 
     processor = load_processor(args.model_name)
@@ -1508,193 +1224,103 @@ def main():
     if len(dataset) == 0:
         raise ValueError("Dataset Empty")
 
-    all_indices = list(range(len(dataset)))
-    all_labels = [x[1] for x in dataset.video_files]
-    all_groups = build_source_groups(dataset.video_files)
-
-    n_unique_sources = len(set(all_groups))
-    print(
-        f"Dataset has {len(all_indices)} clips from {n_unique_sources} unique source "
-        f"videos ({len(all_indices) / n_unique_sources:.1f} clips/video on average)."
-    )
-
-    # NOTE: split_seed is intentionally independent of --seed, so the held-out
-    # test set stays fixed even if you sweep training seeds for variance runs.
-    # Grouped by source video (see extract_source_id) so multiple clips drawn
-    # from the same original video (e.g. via the max_emotion/center/random
-    # distillation passes with k>1) can never span both the CV pool and the
-    # test set -- doing so would let the model partly recognize the subject/
-    # scene instead of generalizing, inflating reported metrics.
-    test_n_splits = max(2, round(1.0 / args.test_split))
-    cv_indices, test_indices = grouped_stratified_split(
-        all_indices,
-        all_labels,
-        all_groups,
-        test_size=args.test_split,
-        random_state=args.split_seed,
-        n_splits=test_n_splits,
-    )
-    assert_no_group_leakage(
-        cv_indices, test_indices, all_groups, label_a="CV pool", label_b="held-out test set"
+    table = protocol.ClipTable(
+        dataset.video_files, group_by=args.group_by, subject_regex=args.subject_regex
     )
     print(
-        f"Verified: zero source-video overlap between CV pool ({len(set(all_groups[i] for i in cv_indices))} "
-        f"unique videos) and test set ({len(set(all_groups[i] for i in test_indices))} unique videos)."
+        f"Dataset has {len(dataset)} clips from {len(table.videos)} source videos "
+        f"({len(set(table.video_groups))} {args.group_by} groups). Test clips: "
+        f"{'label-agnostic <video>_test_1' if table.has_test_clips else 'top-ranked clip (_1) per video'}."
     )
 
-    # --- Optional: thin the test set down to one clip per mode per video ---
-    # This ONLY removes clips from the (already-decided) test set; it never
-    # changes which source videos are in train/val/test, and cannot affect
-    # the leakage guarantees above (filtering a subset of a disjoint split
-    # can't create overlap). See filter_test_indices_top_clip_only.
-    if args.test_top_clip_only:
-        pre_filter_test_indices = test_indices
-        pre_filter_test_videos = set(all_groups[i] for i in pre_filter_test_indices)
+    folds = protocol.make_outer_folds(
+        table, args.n_folds, args.fold_file, args.test_split, seed=args.split_seed
+    )
+    resume_fold = resume_fold_of(args.resume_from) if args.resume_from else 1
 
-        test_indices = filter_test_indices_top_clip_only(test_indices, dataset.video_files)
-
-        # --- Sanity checks --------------------------------------------------
-        # 1) Every surviving test clip really is a "_1" clip.
-        surviving_clip_indices = [
-            extract_source_id_and_clip_index(dataset.video_files[i][0])[1] for i in test_indices
-        ]
-        assert all(ci == 1 for ci in surviving_clip_indices), (
-            "test_top_clip_only: filtering left a non-index-1 clip in the test set -- "
-            "this should be impossible, check filter_test_indices_top_clip_only."
+    pooled_labels, pooled_preds, fold_reports, fold_summaries = [], [], [], []
+    for fold_id, (train_pool_videos, test_videos) in enumerate(folds, start=1):
+        cv_indices = table.training_clip_indices(train_pool_videos)
+        test_indices = table.test_clip_indices(test_videos)
+        protocol.assert_disjoint(
+            cv_indices, test_indices, table.groups, label_a="training pool", label_b="test fold"
         )
-
-        # 2) No source video was dropped entirely by the filter (every mode's
-        #    numbering always starts at 1 for a video that produced any
-        #    qualified segments in that mode, per save_qualified_segments, so
-        #    filtering to index==1 should never remove a video's only
-        #    representation in the test set -- verify rather than assume).
-        post_filter_test_videos = set(all_groups[i] for i in test_indices)
-        dropped_videos = pre_filter_test_videos - post_filter_test_videos
-        assert not dropped_videos, (
-            f"test_top_clip_only: {len(dropped_videos)} test source video(s) lost ALL "
-            f"representation after filtering to index-1 clips (e.g. {sorted(dropped_videos)[:5]}...). "
-            f"This means one or more test videos never produced a '_1' clip in any mode, "
-            f"which should not be possible given how save_qualified_segments numbers clips. "
-            f"Investigate before trusting held-out test metrics."
-        )
-        assert post_filter_test_videos.issubset(pre_filter_test_videos), (
-            "test_top_clip_only: filtering somehow introduced a source video that wasn't "
-            "in the test set before filtering -- this should be impossible."
-        )
-
-        # 3) Re-verify group-disjointness against the CV pool on the filtered
-        #    indices (filtering a subset of an already-disjoint split can't
-        #    introduce leakage, but this is cheap and removes any doubt).
-        assert_no_group_leakage(
-            cv_indices, test_indices, all_groups,
-            label_a="CV pool", label_b="held-out test set (top-clip-only)",
-        )
-
         print(
-            f"--test_top_clip_only: reduced test set from {len(pre_filter_test_indices)} to "
-            f"{len(test_indices)} clips ({len(post_filter_test_videos)} source videos retained, "
-            f"same as before filtering)."
+            f"\n===== Fold {fold_id}/{len(folds)}: training pool {len(cv_indices)} clips "
+            f"({len(train_pool_videos)} videos) | test {len(test_indices)} clips "
+            f"({len(test_videos)} videos) ====="
         )
 
-    test_sub = Subset(dataset, test_indices)
-    test_ds = AugmentWrapper(test_sub, augment=False)
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=filter_none_collate,
-        persistent_workers=args.num_workers > 0,
-    )
-
-    print(f"Data Distribution: CV Pool={len(cv_indices)}, Test Set={len(test_indices)}")
-
-    if args.n_folds <= 1:
-        result, best_model_path = run_train(args, dataset, cv_indices, device, fold_id=1)
-
-        print("\n" + "=" * 40)
-        print("TRAINING SUMMARY")
-        print("=" * 40)
-        print(f"Val Accuracy: {result['acc']:.4f}")
-        print(f"Val F1-Score: {result['f1']:.4f}")
-
-        with open(os.path.join(args.save_dir, "final_vivit_summary.txt"), "w") as f:
-            f.write(f"Val Accuracy: {result['acc']:.4f}\n")
-            f.write(f"Val F1-Score: {result['f1']:.4f}\n")
-
-        print(f"\nEvaluating Best Model on Held-out Test Set...")
-        if not os.path.exists(best_model_path):
-            print("WARNING: no best model checkpoint found. Skipping test evaluation.")
-            return
-        model = load_vivit(args.model_name, args.num_classes).to(device)
-        model.load_state_dict(
-            torch.load(best_model_path, map_location=device, weights_only=True)
-        )
-
-        save_test_results(model, test_loader, device, dataset.label_map, args.save_dir)
-
-    else:
-        # Stratified, group-aware k-fold CV over the CV pool. Each fold reuses
-        # the *same* held-out test set (carved out once above, grouped by
-        # source video), and each fold's best model is separately evaluated
-        # on it -- giving mean +/- std test metrics, which is what makes
-        # small-class numbers (e.g. disgust) defensible rather than a single
-        # volatile split.
-        #
-        # NOTE: this loop does not slice cv_indices into per-fold subsets
-        # itself -- each call to run_train() receives the *full* CV pool and
-        # performs its own internal grouped train/val split (see
-        # grouped_stratified_split in run_train). What varies per fold here
-        # is fold_args.seed, which changes which source videos land in that
-        # fold's internal val split. StratifiedGroupKFold is only used to
-        # determine how many folds are requested / provide a consistent,
-        # reproducible seed rotation; it is intentionally not used to assign
-        # disjoint fold membership across iterations.
-        cv_labels = [dataset.video_files[i][1] for i in cv_indices]
-        cv_groups = build_source_groups([dataset.video_files[i] for i in cv_indices])
-        sgkf = StratifiedGroupKFold(n_splits=args.n_folds, shuffle=True, random_state=args.split_seed)
-
-        fold_reports = []
-        fold_summaries = []
-        cv_indices_arr = np.array(cv_indices)
-
-        for fold_id, (_, fold_val_relative_idx) in enumerate(
-            sgkf.split(cv_indices_arr, cv_labels, groups=cv_groups), start=1
-        ):
-            # See note above: fold_val_relative_idx is intentionally unused --
-            # run_train performs its own grouped train/val split internally.
+        pred_path = os.path.join(args.save_dir, f"test_predictions_fold{fold_id}.csv")
+        if fold_id < resume_fold:
+            if not os.path.exists(pred_path):
+                raise FileNotFoundError(
+                    f"Resuming at fold {resume_fold} needs {pred_path} from the earlier run."
+                )
+            print(f"Fold {fold_id} already completed; loading {pred_path}.")
+            labels, preds = load_fold_predictions(pred_path)
+        else:
             fold_args = argparse.Namespace(**vars(args))
             fold_args.seed = args.seed + fold_id
-
-            result, best_model_path = run_train(fold_args, dataset, cv_indices, device, fold_id=fold_id)
+            result, best_model_path = run_train(
+                fold_args, dataset, table, cv_indices, device, fold_id=fold_id
+            )
             fold_summaries.append(result)
+            if not os.path.exists(best_model_path):
+                print(f"WARNING: fold {fold_id} produced no checkpoint; skipping its test fold.")
+                continue
 
-            if os.path.exists(best_model_path):
-                model = load_vivit(args.model_name, args.num_classes).to(device)
-                model.load_state_dict(
-                    torch.load(best_model_path, map_location=device, weights_only=True)
-                )
-                report_dict, acc, f1, macro_f1 = save_test_results(
-                    model, test_loader, device, dataset.label_map, args.save_dir, suffix=f"_fold{fold_id}"
-                )
-                fold_reports.append(report_dict)
-                del model
-                torch.cuda.empty_cache()
+            test_loader = DataLoader(
+                AugmentWrapper(Subset(dataset, test_indices), augment=False),
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                collate_fn=filter_none_collate,
+            )
+            model = load_vivit(args.model_name, args.num_classes).to(device)
+            model.load_state_dict(
+                torch.load(best_model_path, map_location=device, weights_only=True)
+            )
+            preds, labels = protocol.predict(model, test_loader, device)
+            save_fold_predictions(pred_path, dataset, test_indices, labels, preds)
+            del model
+            torch.cuda.empty_cache()
 
-        print("\n" + "=" * 40)
-        print(f"{args.n_folds}-FOLD CV SUMMARY")
-        print("=" * 40)
-        val_accs = [r["acc"] for r in fold_summaries]
-        val_f1s = [r["f1"] for r in fold_summaries]
-        print(f"Val Accuracy: {np.mean(val_accs):.4f} ± {np.std(val_accs):.4f}")
-        print(f"Val F1-Score: {np.mean(val_f1s):.4f} ± {np.std(val_f1s):.4f}")
+        report, _ = protocol.write_test_results(
+            labels, preds, dataset.label_map, args.save_dir,
+            suffix=f"_fold{fold_id}", title=f"Fold {fold_id} test",
+        )
+        fold_reports.append(report)
+        pooled_labels.append(labels)
+        pooled_preds.append(preds)
 
-        with open(os.path.join(args.save_dir, "final_vivit_summary.txt"), "w") as f:
-            f.write(f"Val Accuracy: {np.mean(val_accs):.4f} ± {np.std(val_accs):.4f}\n")
-            f.write(f"Val F1-Score: {np.mean(val_f1s):.4f} ± {np.std(val_f1s):.4f}\n")
+    if not pooled_labels:
+        print("No fold produced test predictions.")
+        return
 
-        if fold_reports:
-            summarize_cv_results(fold_reports, args.save_dir)
+    print("\n" + "=" * 40)
+    print(f"POOLED TEST RESULTS ({len(fold_reports)} folds)")
+    print("=" * 40)
+    _, metrics = protocol.write_test_results(
+        np.concatenate(pooled_labels), np.concatenate(pooled_preds),
+        dataset.label_map, args.save_dir, suffix="", title="Pooled test",
+    )
+    if len(fold_reports) > 1:
+        protocol.summarize_fold_results(fold_reports, args.save_dir)
+
+    with open(os.path.join(args.save_dir, "final_vivit_summary.txt"), "w") as f:
+        f.write(f"Folds: {len(fold_reports)} (pooled test predictions)\n")
+        for key in ("accuracy", "war", "uar", "macro_f1", "weighted_f1"):
+            f.write(f"Test {key.upper()}: {metrics[key]:.4f}\n")
+        if fold_summaries:
+            f.write(
+                f"Val Accuracy (mean over trained folds): "
+                f"{np.mean([r['acc'] for r in fold_summaries]):.4f}\n"
+            )
+            f.write(
+                f"Val F1-Score (mean over trained folds): "
+                f"{np.mean([r['f1'] for r in fold_summaries]):.4f}\n"
+            )
 
 
 if __name__ == "__main__":

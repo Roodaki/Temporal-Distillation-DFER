@@ -51,6 +51,25 @@ ABSOLUTE_NOISE_FLOOR = 0.01
 
 NUM_RANDOM_SEGMENTS_TO_SAMPLE = NUM_TOP_SEGMENTS_TO_SELECT
 
+# ---- Label-agnostic test clips (max-emotion pass) ----
+# Training clips are scored with the teacher's probability for the video's
+# (mapped) ground-truth class. That score uses the label, so it must never be
+# used to pick the clip a model is *evaluated* on. For every video the
+# max-emotion pass therefore also writes exactly one label-agnostic clip,
+# "<stem>_test_1.mp4", scored as the mean of (1 - p_neutral) over the window
+# (on DeepFace's 0-100 scale: 100 - neutral). Windows whose expressive score
+# is below --absolute_noise_floor are discarded and the highest-scoring
+# remaining window is kept. If a video has no expressive window at all
+# (e.g. a genuinely 'neutral' video), the window with the LOWEST expressive
+# score - i.e. the highest sustained p_neutral - is used instead. This is the
+# same procedure used for unseen videos at deployment time: it needs no label.
+#
+# Training scripts use "<stem>_test_1" clips for every held-out (test) video
+# and never train or validate on them.
+TEST_CLIP_SUFFIX = "test"
+NEUTRAL_EMOTION = "neutral"
+EXPRESSIVE_SCORE_COLUMN = "_expressive_score"
+
 # ---- Center-clips pass ----
 # center_clips needs no emotion CSV / pre-analyzed data at all: it simply
 # picks the K non-overlapping windows whose midpoint is closest to the
@@ -82,48 +101,34 @@ VIDEO_CAPTURE_BACKEND = cv2.CAP_FFMPEG
 MAX_VIDEO_IO_PROCESSES = 32
 
 # ---- K-strategy modes ----
-# K-strategy ONLY applies to the random pass. It has no effect on
-# max_emotion (fully uncapped, see UNCAPPED_K below) or on center_clips
-# (fixed per-video K, no cross-class balancing at all).
-# "fixed"           : a single global K for every class (candidate-pool size
-#                      per video before class-wide balancing kicks in).
+# K is the maximum number of non-overlapping TRAINING clips a single video
+# may contribute. It applies to the max_emotion and random passes (not to
+# center_clips, which always takes one clip per video, and never to the
+# label-agnostic test clip, which is always exactly one per video).
+# "fixed"           : a single global K (--base_k) for every class. For
+#                      max_emotion, leaving --base_k unset means every
+#                      qualifying non-overlapping window is kept, so the
+#                      number of clips depends on the video's expressive
+#                      content.
 # "manual_balance"  : per-class K supplied by hand as a hyperparameter.
-# "auto_balance"    : per-class K computed automatically from class video
-#                      counts so that total *candidate clips per class*
-#                      trend toward parity (oversampling minority classes)
-#                      before the final class-wide balancing step.
+# "auto_balance"    : per-class K inversely proportional to class size:
+#                      K_class = round(base_k * max_class_count / class_count).
+#                      Videos from smaller classes contribute more training
+#                      clips (weighted oversampling); on a balanced dataset
+#                      every class gets K == base_k, i.e. no effect.
 K_STRATEGY_CHOICES = ["fixed", "manual_balance", "auto_balance"]
 
-# ---- Uncapped K for max_emotion (all classes) ----
-# max_emotion no longer uses K/--k_strategy at all. Every class's Phase 1
-# pulls every threshold-qualifying, non-overlapping window it can produce,
-# full stop. Rationale: apply_global_topk_balance()'s target_count is
-# min() across all classes' candidate pools - so whichever class is
-# smallest effectively sets the ceiling every other class gets trimmed
-# down to. Any K cap - even one that's *not* the tightest class - can only
-# ever push a class's pool down, never up, so a too-conservative K (a bad
-# auto_balance estimate, or an under-set --manual_k) can quietly produce a
-# false minimum that global_topk has no way to detect or correct (it only
-# trims classes ABOVE target_count, never pads classes below it). Removing
-# K entirely for every class removes that failure mode: each class's pool
-# becomes its true ceiling (threshold + non-overlap, nothing else),
-# target_count becomes the true achievable minimum across classes, and
-# every class is synced to exactly that. UNCAPPED_K is a sentinel consumed
-# by select_non_overlapping_segments(), where it simply never triggers the
-# early-stop, so every qualifying window is kept.
+# ---- Uncapped K ----
+# Sentinel consumed by select_non_overlapping_segments(), where it never
+# triggers the early stop, so every qualifying non-overlapping window is
+# kept. Used by max_emotion when --base_k is not set with k_strategy=fixed.
 UNCAPPED_K = float("inf")
 
-# ---- Class-wide balancing (final step for max_emotion) ----
-# K-strategy controls how large a CANDIDATE pool each video is allowed to
-# contribute (oversampling minority classes at the per-video level). But if
-# a class has enough videos, even a small per-video K can still add up to
-# far more candidates than a minority class can ever produce in total - K
-# only pushes candidate counts UP, nothing pulls an oversized class DOWN.
-#
-# BALANCE_MODE controls what happens after all candidates are scored:
+# ---- Optional class-wide undersampling (max_emotion training clips) ----
+# Class imbalance is handled by --k_strategy auto_balance (oversampling).
+# BALANCE_MODE is an optional extra step applied after scoring:
 #   "none"        : keep every qualified candidate, exactly as K produced it
-#                    (old behaviour - classes stay imbalanced if their
-#                    videos collectively out-produce minority classes).
+#                    (default).
 #   "global_topk" : compute target_count = size of the SMALLEST class's
 #                    candidate pool (after K-oversampling has done its
 #                    best). Any class with MORE candidates than target_count
@@ -580,6 +585,40 @@ def group_candidates_by_video(candidates: list[dict]) -> dict:
 
 
 # =========================================================================
+# Label-agnostic test-clip selection
+# =========================================================================
+
+
+def select_label_agnostic_test_window(
+    df: pd.DataFrame,
+    trim_window_size: int,
+    total_frames_original_video: int,
+    absolute_noise_floor: float,
+) -> dict | None:
+    """Pick the single test/deployment clip for a video without using its label.
+
+    Score_test(W_i) = mean over the window of (1 - p_neutral), i.e.
+    100 - neutral on DeepFace's 0-100 scale. Windows below
+    `absolute_noise_floor` carry no expressive content and are discarded;
+    the highest-scoring remaining window is returned. If every window is
+    discarded (an entirely non-expressive video), the window with the lowest
+    Score_test - the highest sustained p_neutral - is returned instead.
+    """
+    scored = df.assign(**{EXPRESSIVE_SCORE_COLUMN: 100.0 - df[NEUTRAL_EMOTION]})
+    windows = evaluate_sliding_windows(
+        scored, EXPRESSIVE_SCORE_COLUMN, trim_window_size, total_frames_original_video
+    )
+    if not windows:
+        return None
+    expressive = [w for w in windows if w["mean_score"] >= absolute_noise_floor]
+    if expressive:
+        chosen = max(expressive, key=lambda w: w["mean_score"])
+    else:
+        chosen = min(windows, key=lambda w: w["mean_score"])
+    return dict(chosen)
+
+
+# =========================================================================
 # Max-emotion: Phase 1 (score only, no writing)
 # =========================================================================
 
@@ -659,6 +698,13 @@ def score_single_video_max_emotion_worker(task_args_tuple):
             "candidates": [],
         }
 
+    if NEUTRAL_EMOTION not in df.columns:
+        return {
+            "status": f"{relative_class_dir}/{video_stem}: Error - '{NEUTRAL_EMOTION}' column not found in CSV (needed for the label-agnostic test clip).",
+            "class_name": video_class,
+            "candidates": [],
+        }
+
     original_video_file = find_source_video(
         source_videos_root, relative_class_dir, video_stem, video_extensions
     )
@@ -701,6 +747,25 @@ def score_single_video_max_emotion_worker(task_args_tuple):
             "candidates": [],
         }
 
+    video_key = f"{relative_class_dir}/{video_stem}"
+    video_fields = {
+        "video_key": video_key,
+        "class_name": video_class,
+        "video_stem": video_stem,
+        "relative_class_dir": str(relative_class_dir),
+        "original_video_file": str(original_video_file),
+        "fps": fps,
+        "frame_width": frame_width,
+        "frame_height": frame_height,
+    }
+
+    # Label-agnostic test clip (never uses video_class / target_emotion).
+    test_candidate = select_label_agnostic_test_window(
+        df, trim_window_size, total_frames_original_video, absolute_noise_floor
+    )
+    if test_candidate is not None:
+        test_candidate.update(video_fields)
+
     # Highest mean target-emotion score first.
     all_evaluated_segments.sort(key=lambda x: x["mean_score"], reverse=True)
     non_overlapping_candidates = select_non_overlapping_segments(
@@ -712,6 +777,7 @@ def score_single_video_max_emotion_worker(task_args_tuple):
             "status": f"{relative_class_dir}/{video_stem}: No non-overlapping candidate segments found.",
             "class_name": video_class,
             "candidates": [],
+            "test_candidate": test_candidate,
         }
 
     # Qualification is relative to THIS VIDEO's own best window, rather than
@@ -727,16 +793,8 @@ def score_single_video_max_emotion_worker(task_args_tuple):
         if segment["mean_score"] >= relative_floor
     ]
 
-    video_key = f"{relative_class_dir}/{video_stem}"
     for segment in qualified_segments:
-        segment["video_key"] = video_key
-        segment["class_name"] = video_class
-        segment["video_stem"] = video_stem
-        segment["relative_class_dir"] = str(relative_class_dir)
-        segment["original_video_file"] = str(original_video_file)
-        segment["fps"] = fps
-        segment["frame_width"] = frame_width
-        segment["frame_height"] = frame_height
+        segment.update(video_fields)
 
     status = (
         f"{video_key}: Scored. {len(qualified_segments)} candidates qualified "
@@ -752,6 +810,7 @@ def score_single_video_max_emotion_worker(task_args_tuple):
         "status": status,
         "class_name": video_class,
         "candidates": qualified_segments,
+        "test_candidate": test_candidate,
     }
 
 
@@ -790,9 +849,10 @@ def write_candidates_for_video_worker(task_args_tuple):
     class_output_dir = trimmed_output_root / relative_class_dir
     class_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Keep chronological order in the output filenames for readability.
+    # Number clips by salience: "_1" is always the highest-scoring clip of
+    # the video, "_2" the next, and so on.
     ordered_candidates = sorted(
-        candidates_for_video, key=lambda c: c["video_start_frame"]
+        candidates_for_video, key=lambda c: c["mean_score"], reverse=True
     )
 
     saved_count = save_qualified_segments(
@@ -1028,8 +1088,10 @@ def run_two_phase_pass(
     (currently just max_emotion).
 
     Phase 1: score every video in parallel (no writing).
-    Between phases: group candidates by class, apply class-wide balancing.
-    Phase 2: write the surviving candidates, grouped back by video, in parallel.
+    Between phases: group training candidates by class, apply the optional
+    class-wide balancing (test candidates are never balanced or trimmed).
+    Phase 2: write the surviving training candidates and the one
+    label-agnostic test candidate per video, in parallel.
     """
     print(f"\n=== {pass_label} pass (balance_mode={balance_mode}) ===")
 
@@ -1047,12 +1109,15 @@ def run_two_phase_pass(
 
     error_or_skip_count = 0
     candidates_by_class = defaultdict(list)
+    test_candidates = []
     for result in phase1_results:
         print(f"  {result['status']}")
         if "Error" in result["status"] or "Skipping" in result["status"]:
             error_or_skip_count += 1
         if result["class_name"] is not None:
             candidates_by_class[result["class_name"]].extend(result["candidates"])
+        if result.get("test_candidate") is not None:
+            test_candidates.append(result["test_candidate"])
 
     print("\nPhase 1 candidate pool per class (before class-wide balancing):")
     for class_name in sorted(candidates_by_class):
@@ -1069,7 +1134,7 @@ def run_two_phase_pass(
         for candidate in candidates
     ]
 
-    if not all_surviving_candidates:
+    if not all_surviving_candidates and not test_candidates:
         print("\nNo candidates survived balancing - nothing to write.")
         return
 
@@ -1087,10 +1152,23 @@ def run_two_phase_pass(
         )
         for video_key, video_candidates in candidates_by_video.items()
     ]
+    phase2_tasks += [
+        (
+            candidate["video_key"],
+            [candidate],
+            str(trimmed_output_root),
+            TEST_CLIP_SUFFIX,
+            trim_window_size,
+            FOURCC_CODEC,
+            OUTPUT_VIDEO_EXTENSION,
+        )
+        for candidate in test_candidates
+    ]
 
     print(
-        f"\nPhase 2: writing {len(all_surviving_candidates)} surviving segments "
-        f"across {len(phase2_tasks)} videos with {num_processes_to_use} processes..."
+        f"\nPhase 2: writing {len(all_surviving_candidates)} training segments and "
+        f"{len(test_candidates)} label-agnostic test segments with "
+        f"{num_processes_to_use} processes..."
     )
 
     phase2_start = time.time()
@@ -1109,7 +1187,10 @@ def run_two_phase_pass(
     print(f"Trimmed videos are in: {trimmed_output_root}")
 
 
-def run_max_emotion_pass(args, trim_window_size):
+def run_max_emotion_pass(args, trim_window_size, per_class_k: dict | None):
+    if args.logs is None:
+        print("Error: --logs is required for the max_emotion pass.")
+        return
     source_videos_root = pathlib.Path(args.source_dir)
     pre_analyzed_root = pathlib.Path(args.logs)
     trimmed_output_root = pathlib.Path(args.output_dir) / "max_emotion"
@@ -1128,9 +1209,9 @@ def run_max_emotion_pass(args, trim_window_size):
         print(f"No '*_analyze' folders found under {pre_analyzed_root}.")
         return
 
-    # No K/--k_strategy involved here - every class's Phase 1 takes every
-    # threshold-qualifying, non-overlapping window it can find. See the
-    # UNCAPPED_K comment near the top of the file for why.
+    # Per-class K (see K_STRATEGY_CHOICES). With k_strategy=fixed and no
+    # --base_k, every qualifying non-overlapping window is kept.
+    base_k = args.base_k if args.base_k is not None else UNCAPPED_K
     tasks_args_list = [
         (
             str(folder_path),
@@ -1140,7 +1221,7 @@ def run_max_emotion_pass(args, trim_window_size):
             VIDEO_EXTENSIONS,
             EMOTIONS,
             trim_window_size,
-            UNCAPPED_K,
+            get_k_for_class(per_class_k, folder_path.parent.name, base_k),
             args.relative_score_floor_fraction,
             args.absolute_noise_floor,
         )
@@ -1244,7 +1325,9 @@ def run_random_pass(args, trim_window_size, per_class_k: dict | None):
             str(trimmed_output_root),
             trim_window_size,
             get_k_for_class(
-                per_class_k, video_path.parent.name, NUM_RANDOM_SEGMENTS_TO_SAMPLE
+                per_class_k,
+                video_path.parent.name,
+                args.base_k if args.base_k is not None else NUM_RANDOM_SEGMENTS_TO_SAMPLE,
             ),
             FOURCC_CODEC,
             OUTPUT_VIDEO_EXTENSION,
@@ -1304,7 +1387,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument(
         "--logs",
         type=str,
-        required=True,
+        default=None,
         help="Root of per-video emotion CSV logs produced by analyze_videos.py. "
         "Only required for --mode max_emotion or both (center_clips and random "
         "need no emotion CSV at all).",
@@ -1328,17 +1411,23 @@ def get_args() -> argparse.Namespace:
         type=str,
         choices=K_STRATEGY_CHOICES,
         default="fixed",
-        help="How large a CANDIDATE pool (K) to gather per video, per class, before "
-        "class-wide balancing. ONLY APPLIES TO THE RANDOM PASS - max_emotion no "
-        "longer uses K at all; it takes every threshold-qualifying, "
-        "non-overlapping window it can find, then --balance_mode syncs all "
-        "classes down to the smallest class's true total (see module "
-        "docstring near UNCAPPED_K). center_clips also does not use K here - "
-        "its per-video K is the fixed NUM_CENTER_SEGMENTS_TO_SELECT constant. "
-        "'fixed': one global K for every class. 'manual_balance': supply K "
-        "per class by hand via --manual_k. 'auto_balance' (default): K is "
-        "computed automatically from class video counts so total candidates "
-        "per class trend toward parity.",
+        help="Maximum number of non-overlapping TRAINING clips (K) each video may "
+        "contribute, per class. Applies to the max_emotion and random passes "
+        "(center_clips always takes one clip per video; the label-agnostic test "
+        "clip is always one per video). 'fixed' (default): --base_k for every "
+        "class. 'manual_balance': K per class via --manual_k. 'auto_balance': K "
+        "inversely proportional to class size, "
+        "K_class = round(base_k * max_class_count / class_count), so videos of "
+        "smaller classes contribute more clips (no effect on balanced datasets).",
+    )
+    parser.add_argument(
+        "--base_k",
+        type=int,
+        default=None,
+        help="Base K for --k_strategy. Default: unset, meaning max_emotion keeps every "
+        "qualifying non-overlapping window (k_strategy=fixed) and random takes "
+        f"{NUM_RANDOM_SEGMENTS_TO_SAMPLE} clip per video. Required for "
+        "max_emotion with --k_strategy auto_balance.",
     )
     parser.add_argument(
         "--manual_k",
@@ -1347,24 +1436,18 @@ def get_args() -> argparse.Namespace:
         help="Only used when --k_strategy manual_balance (which, like all of "
         "--k_strategy, only affects the random pass). Comma-separated "
         "'class=K' pairs, e.g. \"happy=5,sad=20,angry=15,disgust=40\". "
-        "Classes not listed fall back to the default base K "
-        "(NUM_RANDOM_SEGMENTS_TO_SAMPLE).",
+        "Classes not listed fall back to --base_k.",
     )
     parser.add_argument(
         "--balance_mode",
         type=str,
         choices=BALANCE_MODE_CHOICES,
         default=DEFAULT_BALANCE_MODE,
-        help="Final class-wide balancing step for the max_emotion pass, applied "
-        "AFTER every class's Phase 1 has taken every threshold-qualifying, "
-        "non-overlapping window it can find (--relative_score_floor_fraction). "
-        "'global_topk' (default): target_count = size of the smallest class's "
-        "candidate pool; any class with more candidates than target_count is "
-        "trimmed down to its class-wide best target_count candidates by score "
-        "(pooled across all videos in that class). Classes at or below "
-        "target_count keep everything. 'none': keep every qualified candidate "
-        "K/gating produced, with no cross-class trimming (old behaviour). Does "
-        "not apply to center_clips or random.",
+        help="Optional class-wide undersampling of max_emotion TRAINING clips, applied "
+        "after scoring. 'none' (default): keep every qualified candidate. "
+        "'global_topk': trim every class down to the smallest class's candidate "
+        "count, keeping its best-scoring candidates. Test clips are never "
+        "affected. Does not apply to center_clips or random.",
     )
     parser.add_argument(
         "--relative_score_floor_fraction",
@@ -1380,7 +1463,8 @@ def get_args() -> argparse.Namespace:
         type=float,
         default=ABSOLUTE_NOISE_FLOOR,
         help="Max-emotion pass: absolute backstop (0-100 scale) below which a "
-        "window is never accepted, regardless of the relative floor "
+        "window is treated as non-expressive. Applies to the label-guided "
+        "training score and to the label-agnostic test score "
         "(default: %(default)s).",
     )
     return parser.parse_args()
@@ -1398,16 +1482,22 @@ if __name__ == "__main__":
     output_root = pathlib.Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # K/--k_strategy is only meaningful for the random pass now (max_emotion
-    # is fully uncapped and center_clips uses a fixed constant - see the
-    # comments near UNCAPPED_K and NUM_CENTER_SEGMENTS_TO_SELECT near the
-    # top of the file). Only resolve it - and only require --manual_k for
-    # manual_balance - when random is actually going to run.
+    # K/--k_strategy applies to max_emotion and random (center_clips always
+    # takes one clip per video).
+    if (
+        args.k_strategy == "auto_balance"
+        and args.base_k is None
+        and args.mode in ("max_emotion", "both")
+    ):
+        raise SystemExit(
+            "--k_strategy auto_balance needs --base_k for the max_emotion pass "
+            "(K for the largest class; smaller classes get proportionally more)."
+        )
     per_class_k_map = None
-    if args.mode in ("random", "both"):
+    if args.mode in ("max_emotion", "random", "both"):
         per_class_k_map = resolve_per_class_k(
             k_strategy=args.k_strategy,
-            base_k=NUM_TOP_SEGMENTS_TO_SELECT,
+            base_k=args.base_k if args.base_k is not None else NUM_TOP_SEGMENTS_TO_SELECT,
             manual_k_string=args.manual_k,
             source_root=pathlib.Path(args.source_dir),
             video_extensions=VIDEO_EXTENSIONS,
@@ -1416,7 +1506,7 @@ if __name__ == "__main__":
     overall_start = time.time()
 
     if args.mode in ("max_emotion", "both"):
-        run_max_emotion_pass(args, TRIM_WINDOW_SIZE)
+        run_max_emotion_pass(args, TRIM_WINDOW_SIZE, per_class_k_map)
 
     if args.mode in ("center_clips", "both"):
         run_center_clips_pass(args, TRIM_WINDOW_SIZE)
