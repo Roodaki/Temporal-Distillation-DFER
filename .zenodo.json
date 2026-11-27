@@ -1,0 +1,27 @@
+{
+  "title": "Temporal-Distillation-DFER: Code for \"Emotion-Guided Data Distillation for Spatio-Temporal Feature Learning in Video Transformer-Based Dynamic Facial Expression Recognition\"",
+  "description": "Code for the paper \"Emotion-Guided Data Distillation for Spatio-Temporal Feature Learning in Video Transformer-Based Dynamic Facial Expression Recognition\": video preprocessing, emotion-guided temporal distillation, and fine-tuning of video transformers (ViViT and TimeSformer) for dynamic facial expression recognition on the Emognition and DFEW datasets.",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "MIT",
+  "creators": [
+    {
+      "name": "Roodaki, AmirHossein",
+      "affiliation": "Department of Computer Science, University of Victoria, Victoria, Canada",
+      "orcid": "0009-0008-5765-0529"
+    },
+    {
+      "name": "Mbilinyi, Ashery",
+      "affiliation": "Department of Computer Science, University of Victoria, Victoria, Canada",
+      "orcid": "0009-0009-1372-9072"
+    }
+  ],
+  "keywords": [
+    "Data Distillation",
+    "Dynamic Facial Expression Recognition",
+    "Temporal Clip Selection",
+    "TimeSformer",
+    "Video Transformer Architectures",
+    "Video Vision Transformer"
+  ]
+}

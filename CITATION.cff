@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+type: software
+title: "Temporal-Distillation-DFER: Code for \"Emotion-Guided Data Distillation for Spatio-Temporal Feature Learning in Video Transformer-Based Dynamic Facial Expression Recognition\""
+authors:
+  - family-names: Roodaki
+    given-names: AmirHossein
+    affiliation: "Department of Computer Science, University of Victoria, Victoria, Canada"
+    orcid: "https://orcid.org/0009-0008-5765-0529"
+  - family-names: Mbilinyi
+    given-names: Ashery
+    affiliation: "Department of Computer Science, University of Victoria, Victoria, Canada"
+    orcid: "https://orcid.org/0009-0009-1372-9072"
+repository-code: "https://github.com/Roodaki/Temporal-Distillation-DFER"
+license: MIT
+keywords:
+  - Data Distillation
+  - Dynamic Facial Expression Recognition
+  - Temporal Clip Selection
+  - TimeSformer
+  - Video Transformer Architectures
+  - Video Vision Transformer
+preferred-citation:
+  type: article
+  title: "Emotion-Guided Data Distillation for Spatio-Temporal Feature Learning in Video Transformer-Based Dynamic Facial Expression Recognition"
+  authors:
+    - family-names: Roodaki
+      given-names: AmirHossein
+      orcid: "https://orcid.org/0009-0008-5765-0529"
+    - family-names: Sotoodeh
+      given-names: Mahmood
+    - family-names: Moosavi
+      given-names: Mohammad R.
+    - family-names: Mbilinyi
+      given-names: Ashery
+      orcid: "https://orcid.org/0009-0009-1372-9072"
+  year: 2026
