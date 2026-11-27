@@ -25,8 +25,8 @@ import argparse
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 # IMPORTANT:
-# Use "skip" only if videos are already face-cropped.
-# Since your input folder is DFEW_face, this is likely appropriate.
+# Use "skip" only if videos are already face-cropped, e.g. the output of
+# src/video_preprocessing/extract_faces_mtcnn.py.
 DETECTOR_BACKEND = "skip"
 
 # With detector_backend="skip", alignment is not useful.

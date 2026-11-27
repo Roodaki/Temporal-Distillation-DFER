@@ -2,9 +2,9 @@
 
 [![DOI](https://zenodo.org/badge/1073745175.svg)](https://doi.org/10.5281/zenodo.21793814)
 
-This repository provides a modular, end-to-end pipeline for processing raw video datasets, distilling them into high-signal expressive temporal segments using emotion-based salience scoring, and fine-tuning video transformer models for dynamic facial expression recognition (DFER).
+Code for the paper: video preprocessing, emotion-guided temporal distillation, and fine-tuning of video transformers for dynamic facial expression recognition (DFER).
 
-<img width="720" height="1133" alt="shematic" src="https://github.com/user-attachments/assets/679b0bf5-c19a-4611-b48a-66134f4f4091" />
+<img width="720" height="1133" alt="schematic" src="https://github.com/user-attachments/assets/679b0bf5-c19a-4611-b48a-66134f4f4091" />
 
 
 ## Requirements
@@ -31,7 +31,7 @@ Pretrained Hugging Face backbones and training checkpoints are written locally a
 
 ## Training
 
-Naturalistic facial expression datasets often contain long videos with neutral, low-signal, or redundant frames. Before fine-tuning a video transformer, raw videos are run through a distillation pipeline that normalizes orientation, isolates the face, computes frame-by-frame emotion probabilities with an off-the-shelf teacher model (DeepFace), and distills each video into compact, high-signal clips. The teacher is used only for temporal localization: clips keep the dataset's original video-level labels, and teacher predictions are never used as training labels.
+Before fine-tuning, raw videos are processed in four steps: geometric normalization, face cropping, frame-by-frame emotion analysis with DeepFace, and extraction of fixed-length clips. The method is described in the paper.
 
 ### 1. Geometric Normalization & Face ROI Extraction
 
@@ -41,7 +41,7 @@ For Emognition, first rotate every video 90° clockwise to correct the recording
 src\video_preprocessing\rotate_videos.bat
 ```
 
-Then use MTCNN to detect and crop the facial region in every frame, removing background noise:
+Then detect and crop the face in every frame with MTCNN:
 
 ```train
 python src/video_preprocessing/extract_faces_mtcnn.py \
@@ -51,7 +51,7 @@ python src/video_preprocessing/extract_faces_mtcnn.py \
 
 ### 2. Frame-by-Frame Emotion Analysis
 
-Generate emotion probability logs (`P_t = <p_t,1, ..., p_t,c>`) for each frame using DeepFace.
+Compute per-frame emotion probabilities with DeepFace:
 
 ```train
 python src/video_preprocessing/analyze_videos.py \
@@ -61,12 +61,9 @@ python src/video_preprocessing/analyze_videos.py \
 
 ### 3. Temporal Distillation & Baselines
 
-A single consolidated script handles emotion-guided distillation and the baseline clip extractors (center and random clips). The clip length `L` must match the model input: **16 frames for ViViT, 8 frames for TimeSformer**.
+`trim_videos.py` extracts the clips for the proposed emotion-guided distillation and for the two baselines (center-clip and random sampling). The clip length `L` is **16 frames for ViViT and 8 frames for TimeSformer**.
 
-**Emotion-guided distillation (max-emotion):** a window of `L` frames slides over each video (stride 1) and is scored by the mean teacher probability over its frames. Windows with no expressive content are discarded, and the remaining windows are selected greedily in descending score order while removing any window that overlaps an already-selected one (temporal non-maximum suppression). For every video the script writes two kinds of clips:
-
-- **Training clips** (`<video>_max_emotion_<k>.mp4`, numbered by salience): scored with the probability of the video's label mapped to the teacher's classes (e.g. `amusement`, `liking`, `enthusiasm` → `happy`; `awe` → `surprise`).
-- **One label-agnostic test clip** (`<video>_test_1.mp4`): scored with the mean of `1 - p_neutral`, without access to the label. If a video has no expressive window at all, the window with the highest sustained `p_neutral` is used. This is the same procedure used for any unseen video at deployment time.
+**Emotion-guided distillation** (`--mode max_emotion`) writes training clips (`<video>_max_emotion_<k>.mp4`) and one test clip per video (`<video>_test_1.mp4`), selected without the video's label. Class balancing of the training clips (`--k_strategy auto_balance`) was used for both datasets.
 
 ```train
 # ViViT (L = 16); use --clip_length 8 for TimeSformer
@@ -78,9 +75,7 @@ python src/video_preprocessing/trim_videos.py \
     --clip_length 16
 ```
 
-The number of training clips a video yields depends on its expressive content (long, largely neutral videos yield only a few). To handle class imbalance (e.g. DFEW), pass `--k_strategy auto_balance --base_k <K>`: videos from smaller classes then contribute proportionally more training clips (`K_class = round(K · max_class_count / class_count)`, similar to weighted oversampling). On balanced datasets such as Emognition this has no effect.
-
-**Generating baselines (center & random):** these do not require the emotion CSV logs. Center sampling takes the `L` consecutive frames centered on the video's temporal midpoint; random sampling takes a random window of `L` consecutive frames.
+**Baselines** (`--mode center_clips` or `--mode random`) do not need the emotion logs:
 
 ```train
 python src/video_preprocessing/trim_videos.py \
@@ -90,7 +85,7 @@ python src/video_preprocessing/trim_videos.py \
     --clip_length 16
 ```
 
-Passing `--mode both` extracts the emotion-guided dataset and both baselines simultaneously into three separate subdirectories (`max_emotion`, `center_clips`, and `random`).
+`--mode both` writes all three into separate subdirectories (`max_emotion`, `center_clips`, `random`).
 
 ### 4. Utilities & Visualization
 
@@ -112,22 +107,20 @@ python utils/video_processing/make_fold_file.py \
 
 # Dataset analysis tools
 python utils/video_processing/get_videos_length.py --dataset_root ./data/cropped_faces
-python utils/video_processing/count_clips.py --dataset_root ./data/distilled_clips_16
+python utils/video_processing/count_clips.py --output_dir ./data/distilled_clips_16
 python utils/video_processing/analyze_class_score_distributions.py --logs ./data/csv_logs
 ```
 
 ### 5. Model Training
 
-Two pre-trained video transformers are fine-tuned, using the base variant of each, with a linear classification head added on top:
+Two pre-trained video transformers (base variants) are fine-tuned with a linear classification head:
 
 | Model | Clip length (L) | Default checkpoint |
 |-------|-----------------|--------------------|
 | ViViT-Base | 16 | `google/vivit-b-16x2-kinetics400` |
 | TimeSformer-Base | 8 | `facebook/timesformer-base-finetuned-k400` |
 
-Both scripts automatically download the Hugging Face backbones if they are not cached locally. Fine-tuning uses a freeze-unfreeze strategy: the backbone is frozen for the first `--freeze_epochs` epochs so only the classification head trains, then the whole model is unfrozen.
-
-The script defaults match the hyperparameter configuration used for all models:
+The backbones are downloaded from Hugging Face on first use. The script defaults follow the hyperparameters in the paper:
 
 | Hyperparameter | Value |
 |----------------|-------|
@@ -137,7 +130,7 @@ The script defaults match the hyperparameter configuration used for all models:
 | Loss | Focal Loss |
 | LR scheduler | ReduceLROnPlateau on validation loss (patience 3, factor 0.1, min LR 1e-7) |
 | Early stopping | Validation F1, patience 15, min delta 0.001 |
-| Fine-tuning | Freeze-unfreeze |
+| Fine-tuning | Freeze-unfreeze (`--freeze_epochs`) |
 
 ```train
 # Emognition: subject-independent 3-fold cross-validation (ViViT)
@@ -160,39 +153,40 @@ python src/model_training/train_timesformer.py \
     --val_split 0.15
 ```
 
-Additional options cover class-imbalance handling (`--class_weight_scheme`, including the Effective Number of Samples weighting of Cui et al., 2019; `--use_weighted_sampler`), train-time augmentation (`--augment`), separate backbone/head learning rates, and gradient accumulation. Run `python src/model_training/train_timesformer.py --help` for the full list.
+Run a script with `--help` to list all options.
 
 ## Evaluation
 
-Evaluation is built into the training scripts and follows a video-level cross-validation protocol:
+Evaluation runs at the end of training and follows the protocol described in the paper:
 
-- **Folds.** Every source video belongs to exactly one test fold. With `--fold_file`, folds come from a predefined assignment (e.g. the official DFEW split). Otherwise `--n_folds` stratified folds are built with `StratifiedGroupKFold`. `--group_by subject` makes the folds subject-independent: the subject id is parsed from the video name with `--subject_regex`, which defaults to the token before the first underscore (Emognition). `--group_by video` keeps only the clips of one video together.
-- **Validation.** In each fold, a group-disjoint fraction of the training pool (`--val_split`) is held out for early stopping and learning-rate scheduling.
-- **No leakage.** All clips of a video, and with `--group_by subject` all videos of a subject, stay in a single partition. This is asserted at run time.
-- **One clip per test video.** Each test video is represented by its label-agnostic `<video>_test_1` clip. For baseline datasets without test clips, its `_1` clip is used instead.
-- **Pooling.** Test predictions from all folds are pooled to compute the reported metrics.
+- **Folds.** Emognition uses subject-independent folds (`--n_folds 3 --group_by subject`). DFEW uses the official five-fold split (`--fold_file`).
+- **Validation.** In each fold, a held-out part of the training data (`--val_split`) is used for early stopping and learning-rate scheduling.
+- **Partitions.** All clips of a video, and on Emognition all videos of a subject, stay in a single partition.
+- **Test clips.** Each test video is represented by one clip.
+- **Metrics.** Test predictions from all folds are pooled. The sample standard deviation across the test folds and 95% class-stratified bootstrap confidence intervals (10,000 resamples) are reported alongside.
 
 Results are written to `--save_dir`:
-- `final_class_performance.csv` — pooled per-class precision/recall/F1 plus accuracy, WAR, UAR, macro and weighted F1.
-- `test_confusion_matrix.png` — pooled normalized confusion matrix.
-- `final_class_performance_fold<k>.csv`, `test_confusion_matrix_fold<k>.png`, `test_predictions_fold<k>.csv` — per-fold results and predictions.
-- `cv_class_performance_summary.csv` — per-class mean ± std across folds.
-- `final_timesformer_summary.txt` / `final_vivit_summary.txt` — overall run summary.
+- `final_class_performance.csv`: pooled per-class and overall metrics.
+- `test_confusion_matrix.png`: pooled normalized confusion matrix.
+- `final_class_performance_fold<k>.csv`, `test_confusion_matrix_fold<k>.png`, `test_predictions_fold<k>.csv`: per-fold results.
+- `cv_class_performance_summary.csv`: mean ± standard deviation across folds.
+- `pooled_metrics_ci.csv`: confidence intervals of the pooled metrics.
+- `final_timesformer_summary.txt` / `final_vivit_summary.txt`: run summary.
 
-To resume an interrupted run, pass `--resume_from <save_dir>/last_checkpoint_fold<k>.pth`. Earlier folds are then restored from their saved predictions.
+To resume an interrupted run, pass `--resume_from <save_dir>/last_checkpoint_fold<k>.pth`.
 
 ## Results
 
 ### In-The-Lab "Emognition" Dataset
 
-Subject-independent three-fold cross-validation, pooled over all folds.
+Subject-independent three-fold cross-validation. Each cell gives the pooled value ± the standard deviation across folds, with the 95% confidence interval in brackets.
 
 | Model Name | Accuracy | Macro F1-Score |
 |------------|----------|----------------|
-| ViViT | 82.82% | 82.82% |
-| TimeSformer | 81.54% | 81.40% |
+| ViViT | 82.82% ± 3.1 [78.97, 86.41] | 82.82% ± 3.0 [78.98, 86.42] |
+| TimeSformer | 81.54% ± 3.1 [77.69, 85.13] | 81.40% ± 3.1 [77.46, 85.12] |
 
-Ablation of the temporal sampling strategy (same backbones and fine-tuning):
+Ablation of the temporal sampling strategy:
 
 | Model | Sampling Strategy | Accuracy | Macro F1-Score |
 |-------|-------------------|----------|----------------|
@@ -205,16 +199,16 @@ Ablation of the temporal sampling strategy (same backbones and fine-tuning):
 
 ### In-The-Wild "DFEW" Dataset
 
-Official seven-class, five-fold protocol, pooled over all folds.
+Official seven-class, five-fold protocol. Same notation as above.
 
 | Model Name | WAR | UAR | Macro F1-Score |
 |------------|-----|-----|----------------|
-| ViViT | 90.93% | 77.32% | 81.31% |
-| TimeSformer | 89.51% | 74.66% | 77.69% |
+| ViViT | 87.30% ± 0.9 [86.75, 87.86] | 77.75% ± 1.4 [76.56, 78.98] | 80.57% ± 1.6 [79.13, 81.94] |
+| TimeSformer | 86.20% ± 0.9 [85.62, 86.77] | 74.95% ± 1.3 [73.96, 75.96] | 76.95% ± 1.7 [75.54, 78.29] |
 
 ### Pretrained Models
 
-Checkpoints for all trained models are provided below, organized by dataset, architecture, and distillation strategy.
+Trained checkpoints, by dataset, architecture and sampling strategy:
 
 | Dataset        | Architecture    | Distillation Strategy  | Download                                                                                                    |
 | -------------- | --------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------ |
@@ -233,7 +227,7 @@ Checkpoints for all trained models are provided below, organized by dataset, arc
 
 ## Codebase Architecture
 
-The repository is divided into the core pipeline (`src/`) and analysis tools (`utils/`). Pretrained Hugging Face backbones and training checkpoints are written locally at run time and are not tracked in Git.
+The repository is divided into the core pipeline (`src/`) and analysis tools (`utils/`).
 
 ```text
 .
@@ -241,9 +235,7 @@ The repository is divided into the core pipeline (`src/`) and analysis tools (`u
 │   ├── model_training/            # Video transformer fine-tuning scripts
 │   │   ├── evaluation_protocol.py # Cross-validation folds, partitioning & metrics
 │   │   ├── train_timesformer.py
-│   │   ├── train_timesformer_leakage.py
-│   │   ├── train_vivit.py
-│   │   └── train_vivit_leakage.py
+│   │   └── train_vivit.py
 │   └── video_preprocessing/       # Pipeline for data extraction & distillation
 │       ├── analyze_videos.py
 │       ├── extract_faces_mtcnn.py

@@ -48,7 +48,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/home/roodaki/projects/DFEW/data/dfew/DFEW_face_trimmed_8",
+        default="./data/distilled_clips_16",
         help="Root output directory (the same --output_dir passed to the distillation script).",
     )
     parser.add_argument(
