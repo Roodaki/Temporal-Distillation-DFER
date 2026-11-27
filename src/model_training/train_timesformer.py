@@ -1187,7 +1187,7 @@ def main():
     )
     resume_fold = resume_fold_of(args.resume_from) if args.resume_from else 1
 
-    pooled_labels, pooled_preds, fold_reports, fold_summaries = [], [], [], []
+    pooled_labels, pooled_preds, fold_reports, fold_metrics, fold_summaries = [], [], [], [], []
     for fold_id, (train_pool_videos, test_videos) in enumerate(folds, start=1):
         cv_indices = table.training_clip_indices(train_pool_videos)
         test_indices = table.test_clip_indices(test_videos)
@@ -1235,11 +1235,12 @@ def main():
             del model
             torch.cuda.empty_cache()
 
-        report, _ = protocol.write_test_results(
+        report, metrics = protocol.write_test_results(
             labels, preds, dataset.label_map, args.save_dir,
             suffix=f"_fold{fold_id}", title=f"Fold {fold_id} test",
         )
         fold_reports.append(report)
+        fold_metrics.append(metrics)
         pooled_labels.append(labels)
         pooled_preds.append(preds)
 
@@ -1250,26 +1251,11 @@ def main():
     print("\n" + "=" * 40)
     print(f"POOLED TEST RESULTS ({len(fold_reports)} folds)")
     print("=" * 40)
-    _, metrics = protocol.write_test_results(
-        np.concatenate(pooled_labels), np.concatenate(pooled_preds),
-        dataset.label_map, args.save_dir, suffix="", title="Pooled test",
+    protocol.report_pooled_results(
+        pooled_labels, pooled_preds, fold_reports, fold_metrics,
+        dataset.label_map, args, summary_name="final_timesformer_summary.txt",
+        fold_summaries=fold_summaries,
     )
-    if len(fold_reports) > 1:
-        protocol.summarize_fold_results(fold_reports, args.save_dir)
-
-    with open(os.path.join(args.save_dir, "final_timesformer_summary.txt"), "w") as f:
-        f.write(f"Folds: {len(fold_reports)} (pooled test predictions)\n")
-        for key in ("accuracy", "war", "uar", "macro_f1", "weighted_f1"):
-            f.write(f"Test {key.upper()}: {metrics[key]:.4f}\n")
-        if fold_summaries:
-            f.write(
-                f"Val Accuracy (mean over trained folds): "
-                f"{np.mean([r['acc'] for r in fold_summaries]):.4f}\n"
-            )
-            f.write(
-                f"Val F1-Score (mean over trained folds): "
-                f"{np.mean([r['f1'] for r in fold_summaries]):.4f}\n"
-            )
 
 
 if __name__ == "__main__":

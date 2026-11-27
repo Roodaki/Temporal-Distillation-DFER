@@ -6,6 +6,7 @@ import pathlib
 import time
 import numpy as np
 import multiprocessing as mp
+import zlib
 from collections import defaultdict
 
 # =========================================================================
@@ -890,6 +891,7 @@ def process_single_video_random_worker(task_args_tuple):
         num_segments,
         fourcc_codec,
         output_video_extension,
+        seed,
     ) = task_args_tuple
 
     video_path = pathlib.Path(video_path_str)
@@ -920,6 +922,11 @@ def process_single_video_random_worker(task_args_tuple):
             f"({total_frames} frames) for window {trim_window_size}."
         )
 
+    # Per-video generator seeded from --seed and the video's path relative to
+    # the source root, independent of the worker process and processing order.
+    video_key = (pathlib.PurePosixPath(*relative_class_dir.parts) / video_path.name).as_posix()
+    rng = np.random.default_rng([seed, zlib.crc32(video_key.encode("utf-8"))])
+
     # Build every valid window as a candidate (same shape as the score-based
     # workers use), then shuffle so "priority order" is random instead of
     # score order, and run it through the same NMS-style greedy selector so
@@ -932,7 +939,7 @@ def process_single_video_random_worker(task_args_tuple):
         }
         for start_idx in range(max_valid_start_index + 1)
     ]
-    np.random.shuffle(all_candidate_segments)
+    rng.shuffle(all_candidate_segments)
 
     selected_segments = select_non_overlapping_segments(
         all_candidate_segments, num_segments
@@ -1331,12 +1338,13 @@ def run_random_pass(args, trim_window_size, per_class_k: dict | None):
             ),
             FOURCC_CODEC,
             OUTPUT_VIDEO_EXTENSION,
+            args.seed,
         )
         for video_path in video_files
     ]
 
     num_procs = min(MAX_VIDEO_IO_PROCESSES, max(1, mp.cpu_count() - 1))
-    print(f"Starting pool with {num_procs} processes...")
+    print(f"Starting pool with {num_procs} processes (seed={args.seed})...")
 
     start_script = time.time()
     success_count = 0
@@ -1466,6 +1474,14 @@ def get_args() -> argparse.Namespace:
         "window is treated as non-expressive. Applies to the label-guided "
         "training score and to the label-agnostic test score "
         "(default: %(default)s).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random pass: seed for choosing the random windows. Each video uses "
+        "a generator derived from this seed and its path relative to "
+        "--source_dir (default: %(default)s).",
     )
     return parser.parse_args()
 

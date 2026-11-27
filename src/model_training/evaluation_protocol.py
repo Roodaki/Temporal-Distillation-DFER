@@ -20,6 +20,9 @@ Protocol
   "<stem>_test_1" clip when the dataset contains one, otherwise its
   top-ranked clip ("_1").
 * Test predictions of all folds are pooled to compute the final metrics.
+  The sample standard deviation of each metric across the test folds is
+  reported alongside, and confidence intervals of the pooled metrics are
+  estimated with a class-stratified bootstrap (default 10,000 resamples).
 """
 
 from __future__ import annotations
@@ -110,6 +113,25 @@ def add_protocol_args(parser):
         default=1337,
         help="Seed for fold assignment, independent of --seed so folds stay fixed "
         "when sweeping training seeds.",
+    )
+    group.add_argument(
+        "--bootstrap_resamples",
+        type=int,
+        default=10000,
+        help="Class-stratified bootstrap resamples for confidence intervals of the "
+        "pooled metrics (0 disables).",
+    )
+    group.add_argument(
+        "--ci_level",
+        type=float,
+        default=0.95,
+        help="Confidence level of the bootstrap intervals.",
+    )
+    group.add_argument(
+        "--bootstrap_seed",
+        type=int,
+        default=0,
+        help="Seed for the bootstrap resampling.",
     )
     return parser
 
@@ -371,8 +393,22 @@ def write_test_results(labels, preds, label_map, save_dir, suffix="", title="Tes
     return report, metrics
 
 
-def summarize_fold_results(fold_reports, save_dir):
-    """Per-class mean +/- std across folds (complements the pooled results)."""
+METRIC_KEYS = ("accuracy", "war", "uar", "macro_f1", "weighted_f1")
+
+
+def _sample_std(values):
+    """Sample standard deviation (ddof=1) across folds; 0 for a single fold."""
+    values = np.asarray(values, dtype=float)
+    return float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+
+
+def summarize_fold_results(fold_reports, fold_metrics, save_dir):
+    """Mean +/- sample std across test folds (complements the pooled results).
+
+    Writes per-class precision/recall/F1, the macro ("Unweighted Average") and
+    weighted averages, and the overall metrics. Returns
+    {metric: (mean, std)} for METRIC_KEYS.
+    """
     class_names = sorted(
         {
             c
@@ -384,6 +420,7 @@ def summarize_fold_results(fold_reports, save_dir):
     csv_path = os.path.join(save_dir, "cv_class_performance_summary.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
+        writer.writerow([f"Mean ± sample std over {len(fold_reports)} test folds"])
         writer.writerow(
             [
                 "Class Name",
@@ -393,7 +430,7 @@ def summarize_fold_results(fold_reports, save_dir):
                 "Mean Support",
             ]
         )
-        for cls in class_names:
+        for cls in class_names + ["macro avg", "weighted avg"]:
             vals = {
                 k: [r[cls][k] for r in fold_reports if cls in r]
                 for k in ("precision", "recall", "f1-score", "support")
@@ -401,9 +438,166 @@ def summarize_fold_results(fold_reports, save_dir):
             writer.writerow(
                 [cls]
                 + [
-                    f"{np.mean(vals[k]):.4f} ± {np.std(vals[k]):.4f}"
+                    f"{np.mean(vals[k]):.4f} ± {_sample_std(vals[k]):.4f}"
                     for k in ("precision", "recall", "f1-score")
                 ]
                 + [f"{np.mean(vals['support']):.1f}"]
             )
-    print(f"Saved per-fold class-performance summary to: {csv_path}")
+
+        overall = {
+            key: (
+                float(np.mean([m[key] for m in fold_metrics])),
+                _sample_std([m[key] for m in fold_metrics]),
+            )
+            for key in METRIC_KEYS
+        }
+        writer.writerow([])
+        writer.writerow(["Metric", "Mean", "Std", "Per-fold values"])
+        for key in METRIC_KEYS:
+            mean, std = overall[key]
+            per_fold = " ".join(f"{m[key]:.4f}" for m in fold_metrics)
+            writer.writerow([key.upper(), f"{mean:.4f}", f"{std:.4f}", per_fold])
+    print(f"Saved per-fold performance summary to: {csv_path}")
+    return overall
+
+
+def _metrics_from_confusion(cm):
+    """Vectorized compute_metrics() for a stack of confusion matrices (B, K, K).
+
+    Mirrors sklearn with zero_division=0: averages run over the classes that
+    occur in the true or the predicted labels.
+    """
+    tp = np.diagonal(cm, axis1=1, axis2=2).astype(float)
+    support = cm.sum(axis=2).astype(float)
+    predicted = cm.sum(axis=1).astype(float)
+    present = (support > 0) | (predicted > 0)
+    n = support.sum(axis=1)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        precision = np.where(predicted > 0, tp / predicted, 0.0)
+        recall = np.where(support > 0, tp / support, 0.0)
+        f1 = np.where(
+            precision + recall > 0, 2 * precision * recall / (precision + recall), 0.0
+        )
+
+    n_present = present.sum(axis=1)
+    accuracy = tp.sum(axis=1) / n
+    return {
+        "accuracy": accuracy,
+        "war": accuracy,
+        "uar": (recall * present).sum(axis=1) / n_present,
+        "macro_f1": (f1 * present).sum(axis=1) / n_present,
+        "weighted_f1": (f1 * support).sum(axis=1) / n,
+    }
+
+
+def bootstrap_confidence_intervals(
+    labels, preds, n_resamples=10000, confidence=0.95, seed=0, batch_size=250
+):
+    """Class-stratified percentile bootstrap CIs of the pooled metrics.
+
+    Each resample draws, with replacement, the same number of test videos from
+    every true class as the original pooled set, so per-class support is fixed.
+    Returns {metric: (low, high)} for METRIC_KEYS.
+    """
+    labels = np.asarray(labels, dtype=np.int64)
+    preds = np.asarray(preds, dtype=np.int64)
+    num_classes = int(max(labels.max(), preds.max())) + 1
+    class_members = [np.flatnonzero(labels == c) for c in np.unique(labels)]
+    codes = labels * num_classes + preds
+    rng = np.random.default_rng(seed)
+
+    samples = {key: [] for key in METRIC_KEYS}
+    for start in range(0, n_resamples, batch_size):
+        b = min(batch_size, n_resamples - start)
+        idx = np.concatenate(
+            [members[rng.integers(0, len(members), size=(b, len(members)))]
+             for members in class_members],
+            axis=1,
+        )
+        offsets = (np.arange(b) * num_classes * num_classes)[:, None]
+        cm = np.bincount(
+            (codes[idx] + offsets).ravel(), minlength=b * num_classes * num_classes
+        ).reshape(b, num_classes, num_classes)
+        for key, values in _metrics_from_confusion(cm).items():
+            samples[key].append(values)
+
+    tail = (1.0 - confidence) / 2.0 * 100.0
+    return {
+        key: tuple(
+            float(v) for v in np.percentile(np.concatenate(vals), [tail, 100.0 - tail])
+        )
+        for key, vals in samples.items()
+    }
+
+
+def write_final_summary(
+    path, metrics, n_folds, fold_stats=None, cis=None, confidence=0.95,
+    n_resamples=0, fold_summaries=None,
+):
+    """Pooled metrics, fold mean +/- std, and bootstrap CIs in one text file."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"Folds: {n_folds} (pooled test predictions)\n")
+        for key in METRIC_KEYS:
+            line = f"Test {key.upper()}: {metrics[key]:.4f}"
+            if fold_stats:
+                mean, std = fold_stats[key]
+                line += f" | fold mean {mean:.4f} ± {std:.4f} (sample std)"
+            if cis:
+                low, high = cis[key]
+                line += (
+                    f" | {confidence:.0%} CI [{low:.4f}, {high:.4f}] "
+                    f"(class-stratified bootstrap, {n_resamples} resamples)"
+                )
+            f.write(line + "\n")
+        if fold_summaries:
+            f.write(
+                f"Val Accuracy (mean over trained folds): "
+                f"{np.mean([r['acc'] for r in fold_summaries]):.4f}\n"
+            )
+            f.write(
+                f"Val F1-Score (mean over trained folds): "
+                f"{np.mean([r['f1'] for r in fold_summaries]):.4f}\n"
+            )
+    print(f"Saved run summary to: {path}")
+
+
+def report_pooled_results(
+    pooled_labels, pooled_preds, fold_reports, fold_metrics, label_map, args,
+    summary_name, fold_summaries=None,
+):
+    """Pooled metrics + confusion matrix, fold std, bootstrap CIs, summary file."""
+    labels = np.concatenate(pooled_labels)
+    preds = np.concatenate(pooled_preds)
+    _, metrics = write_test_results(
+        labels, preds, label_map, args.save_dir, suffix="", title="Pooled test"
+    )
+
+    fold_stats = None
+    if len(fold_reports) > 1:
+        fold_stats = summarize_fold_results(fold_reports, fold_metrics, args.save_dir)
+
+    cis = None
+    if args.bootstrap_resamples > 0:
+        cis = bootstrap_confidence_intervals(
+            labels, preds, n_resamples=args.bootstrap_resamples,
+            confidence=args.ci_level, seed=args.bootstrap_seed,
+        )
+        csv_path = os.path.join(args.save_dir, "pooled_metrics_ci.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Metric", "Pooled", "CI Low", "CI High", "Level", "Resamples"])
+            for key in METRIC_KEYS:
+                low, high = cis[key]
+                writer.writerow(
+                    [key.upper(), f"{metrics[key]:.4f}", f"{low:.4f}", f"{high:.4f}",
+                     args.ci_level, args.bootstrap_resamples]
+                )
+        print(f"Saved bootstrap confidence intervals to: {csv_path}")
+
+    write_final_summary(
+        os.path.join(args.save_dir, summary_name), metrics, len(fold_reports),
+        fold_stats=fold_stats, cis=cis, confidence=args.ci_level,
+        n_resamples=args.bootstrap_resamples, fold_summaries=fold_summaries,
+    )
+    return metrics
